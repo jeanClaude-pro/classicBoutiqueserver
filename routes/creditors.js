@@ -67,11 +67,11 @@ router.get("/:id/history", async (req, res) => {
   if (!creditor) return res.status(404).json({ error: "Creditor not found" });
   const [loans, repayments] = await Promise.all([
     Loan.find({ creditorId: creditor._id }).populate("createdBy", "username role").sort({ borrowedAt: -1 }).lean(),
-    Expense.find({ creditorId: creditor._id, expenseType: "repayment" }).select("expenseId amountUSD enteredAmount enteredCurrency exchangeRate status repaymentAppliedAt createdAt recordedBy notes").sort({ createdAt: -1 }).lean()
+    Expense.find({ creditorId: creditor._id, expenseType: { $in: ["REPAYMENT", "repayment"] } }).select("expenseId amountUSD enteredAmount enteredCurrency exchangeRate status repaymentAppliedAt createdAt recordedBy notes").sort({ createdAt: -1 }).lean()
   ]);
   const sums = await Promise.all([
     Loan.aggregate([{ $match: { creditorId: creditor._id } }, { $group: { _id: null, total: { $sum: "$amountUSD" } } }]),
-    Expense.aggregate([{ $match: { creditorId: creditor._id, expenseType: "repayment", status: "validated", repaymentAppliedAt: { $ne: null } } }, { $group: { _id: null, total: { $sum: "$amountUSD" } } }])
+    Expense.aggregate([{ $match: { creditorId: creditor._id, expenseType: { $in: ["REPAYMENT", "repayment"] }, status: "validated", repaymentAppliedAt: { $ne: null } } }, { $group: { _id: null, total: { $sum: "$amountUSD" } } }])
   ]);
   res.json({ creditor, loans, repayments, reconciliation: { borrowed: sums[0][0]?.total || 0, repaid: sums[1][0]?.total || 0, calculatedOutstanding: (sums[0][0]?.total || 0) - (sums[1][0]?.total || 0), storedOutstanding: creditor.remainingBalance } });
 });

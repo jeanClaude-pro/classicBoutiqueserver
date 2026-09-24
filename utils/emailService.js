@@ -15,77 +15,16 @@ const COMPANY_SLOGAN = "Votre Partenaire de Confiance";
 const COMPANY_COLOR = "#1e40af";
 const COMPANY_SECONDARY_COLOR = "#dc2626";
 
-// Fonction DEBUG pour voir tous les utilisateurs
-async function debugAllUsers() {
-  try {
-    console.log("🐛 DEBUG: Recherche de TOUS les utilisateurs...");
-    const allUsers = await User.find({}).select("email username role isActive createdAt");
-    console.log(`🐛 DEBUG: Total utilisateurs dans la base: ${allUsers.length}`);
-    
-    allUsers.forEach((user, index) => {
-      console.log(`🐛 DEBUG [${index + 1}]: ${user.email} | ${user.username} | role: "${user.role}" | actif: ${user.isActive} | créé: ${user.createdAt}`);
-    });
-    
-    return allUsers;
-  } catch (error) {
-    console.error("🐛 DEBUG Erreur:", error);
-    return [];
-  }
-}
-
-// Fonction pour obtenir tous les emails des administrateurs - VERSION CORRIGÉE
+// Return only active superadministrators. Never log account details or notify
+// inactive accounts: those are security-sensitive production data.
 async function getAdminEmails() {
   try {
-    console.log("🔍 Recherche des administrateurs...");
-
-    // D'abord, debug complet
-    await debugAllUsers();
-
-    // Essayer différentes méthodes de recherche
-    console.log("🔍 Méthode 1: Recherche exacte 'superadmin'");
-    const method1 = await User.find({ 
+    const adminUsers = await User.find({
       role: "superadmin",
-      isActive: true 
-    }).select("email username role isActive");
-    console.log(`🔍 Méthode 1 trouvée: ${method1.length} admin(s)`);
-
-    console.log("🔍 Méthode 2: Recherche insensible à la casse");
-    const method2 = await User.find({
-      $or: [
-        { role: "superadmin" },
-        { role: "SuperAdmin" },
-        { role: "SUPERADMIN" }
-      ],
-      isActive: true
-    }).select("email username role isActive");
-    console.log(`🔍 Méthode 2 trouvée: ${method2.length} admin(s)`);
-
-    console.log("🔍 Méthode 3: Tous les rôles admin (même inactifs)");
-    const method3 = await User.find({
-      $or: [
-        { role: "superadmin" },
-        { role: "SuperAdmin" },
-        { role: "SUPERADMIN" }
-      ]
-    }).select("email username role isActive");
-    console.log(`🔍 Méthode 3 trouvée: ${method3.length} admin(s)`);
-
-    // Utiliser la méthode qui trouve le plus d'admins
-    let adminUsers = method2; // Méthode insensible à la casse par défaut
-    
-    if (method1.length > adminUsers.length) adminUsers = method1;
-    if (method3.length > adminUsers.length) {
-      console.log("🚨 Utilisation des admins même inactifs comme fallback");
-      adminUsers = method3;
-    }
-
-    console.log(`📧 ${adminUsers.length} administrateur(s) trouvé(s) pour notification:`);
-    adminUsers.forEach(admin => {
-      console.log(`   ✅ ${admin.email} (${admin.username}) - rôle: "${admin.role}" - actif: ${admin.isActive}`);
-    });
-    
-    const adminEmails = adminUsers.map((user) => user.email);
-    return adminEmails;
+      isActive: true,
+      email: { $type: "string", $ne: "" },
+    }).select("email");
+    return [...new Set(adminUsers.map((user) => user.email.trim().toLowerCase()))];
   } catch (error) {
     console.error("❌ Erreur lors de la recherche des administrateurs:", error);
     return [];
@@ -95,23 +34,14 @@ async function getAdminEmails() {
 // Fonction pour envoyer la notification de dépense à tous les administrateurs
 async function sendExpenseNotification(expense) {
   try {
-    console.log("🔄 Lancement de la notification par email...");
-    
     // Obtenir tous les emails des administrateurs actifs
     const adminEmails = await getAdminEmails();
 
     if (adminEmails.length === 0) {
-      console.log("🚨 URGENCE: Aucun administrateur trouvé - tentative d'envoi à un email par défaut");
-      
-      // Fallback d'urgence - envoyer à un email spécifique
-      const emergencyEmail = "votre-email@entreprise.com"; // ⚠️ REMPLACEZ PAR VOTRE EMAIL
-      console.log(`🆘 Envoi d'urgence à: ${emergencyEmail}`);
-      
-      await sendEmailToRecipients(expense, [emergencyEmail]);
+      console.warn("Aucun superadministrateur actif avec email pour la notification de dépense.");
       return;
     }
 
-    console.log(`✅ Notification envoyée à ${adminEmails.length} administrateur(s)`);
     await sendEmailToRecipients(expense, adminEmails);
     
   } catch (error) {

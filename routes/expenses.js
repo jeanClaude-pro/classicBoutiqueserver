@@ -4,15 +4,26 @@ const Expense = require("../models/Expense");
 const Creditor = require("../models/Creditor");
 const mongoose = require("mongoose");
 const authMiddleware = require("../middleware/auth");
+const { requireRole } = require("../middleware/security");
 const nodemailer = require("nodemailer");
 const { normalizeAmountSnapshot } = require("../utils/salePricing");
 const { getFallbackExchangeRate } = require("../utils/currentExchangeRate");
 const { calculateValidationRate } = require("../utils/financialCalculations");
 const {
+  EXPENSE_TYPES,
+  assertCategory,
+  aggregateCategoryAccounting,
+  acquireAccountingLock,
+  projectAccounting,
+  purchaseSnapshot,
+} = require("../services/financialAccountingService");
+const {
   buildTimeframeFilter: buildBusinessTimeframeFilter,
   paginationMetadata,
   parsePagination,
 } = require("../utils/queryHelpers");
+
+router.use(authMiddleware, requireRole("superadmin", "manager", "inventory_manager", "cashier_supervisor"));
 
 // ✅ CREATE EMAIL TRANSPORTER
 const transporter = nodemailer.createTransport({
@@ -398,6 +409,99 @@ function sanitizeInput(input) {
 function isAdminUser(user) {
   return user && (user.role === 'superadmin' || user.isAdmin === true);
 }
+const visibleTimeframeQuery = (req) => ["admin", "superadmin"].includes(req.user?.role) ? req.query : {};
+
+function normalizedExpenseType(value) {
+  if (value === "repayment" || value === EXPENSE_TYPES.REPAYMENT) return EXPENSE_TYPES.REPAYMENT;
+  if (value === EXPENSE_TYPES.COMPANY || value === EXPENSE_TYPES.GOODS) return value;
+  return null;
+}
+
+function accountingError(res, error, fallback) {
+  if (error.code === "INSUFFICIENT_PURCHASE_FUNDS") {
+    return res.status(409).json({ error: error.code, message: error.message, ...error.details });
+  }
+  return res.status(error.status || 500).json({ error: error.status ? error.message : fallback });
+}
+
+// E11000 means different things depending on the unique index that fired.
+// Transaction errors sometimes omit keyPattern/keyValue, so the index name is
+// also read from the server message ("... index: <name> dup key: {...}").
+function duplicateKeyInfo(error) {
+  const index = String(error.errmsg || error.message || "").match(/index: (\S+) dup key/)?.[1] || null;
+  const field = Object.keys(error.keyPattern || error.keyValue || {})[0]
+    || ["expenseId", "requestKey", "reversalOf"].find((name) => index?.startsWith(name))
+    || null;
+  const value = error.keyValue && field ? error.keyValue[field] : undefined;
+  return { index, field, value };
+}
+
+function duplicateKeyError(res, error) {
+  const { index, field, value } = duplicateKeyInfo(error);
+  if (field === "expenseId") {
+    return res.status(409).json({ error: "DUPLICATE_EXPENSE_ID", message: "Un identifiant de dépense identique vient d'être attribué. Rien n'a été enregistré : réessayez." });
+  }
+  if (field === "requestKey") {
+    return res.status(409).json({ error: "IDEMPOTENCY_CONFLICT", message: "Cette clé de requête a déjà été utilisée." });
+  }
+  if (field === "reversalOf") {
+    // A null reversalOf can only collide on the obsolete unique+sparse index
+    // (sparse still indexes explicit nulls): a schema fault, not a conflict.
+    if (value === null || (value === undefined && index !== "reversalOf_unique_when_set")) {
+      console.error(`Expense index misconfigured: '${index}' rejects reversalOf null. Run "npm run migrate:expense-accounting" or restart the server to repair it.`);
+      return res.status(500).json({ error: "EXPENSE_INDEX_MISCONFIGURED" });
+    }
+    return res.status(409).json({ error: "Transaction already reversed" });
+  }
+  console.error("Unexpected duplicate key on expenses:", { index, keyPattern: error.keyPattern, keyValue: error.keyValue });
+  return res.status(409).json({ error: "DUPLICATE_KEY", message: "Cette opération entre en conflit avec un enregistrement existant. Actualisez puis réessayez." });
+}
+
+async function applyAccountingValidation(expense, session) {
+  if (expense.expenseType === EXPENSE_TYPES.REPAYMENT) return;
+  if (![EXPENSE_TYPES.COMPANY, EXPENSE_TYPES.GOODS].includes(expense.expenseType)) {
+    // Legacy cash-outs are never silently attributed to a category.
+    throw Object.assign(new Error("Cette dépense historique n'est pas classée. Rejetez-la puis créez une dépense d'entreprise ou un achat de marchandises."), { status: 409 });
+  }
+  assertCategory(expense.category);
+  await acquireAccountingLock(expense.category, session);
+  const accounting = await aggregateCategoryAccounting(expense.category, { session });
+  const amountUSD = expense.amountUSD ?? expense.amount;
+  if (expense.expenseType === EXPENSE_TYPES.GOODS) {
+    const snapshot = purchaseSnapshot(accounting, amountUSD);
+    if (expense.exchangeRate) {
+      snapshot.financialSnapshot.capitalUsedFC = Number((snapshot.financialSnapshot.capitalUsed * expense.exchangeRate).toFixed(6));
+      snapshot.financialSnapshot.profitUsedFC = Number((snapshot.financialSnapshot.profitUsed * expense.exchangeRate).toFixed(6));
+    }
+    expense.fundingSource = snapshot.fundingSource;
+    expense.financialSnapshot = snapshot.financialSnapshot;
+    return;
+  }
+  const after = projectAccounting(accounting, { companyExpenses: amountUSD });
+  expense.financialSnapshot = {
+    generatedCapital: accounting.recoveredCapital,
+    grossProfit: accounting.grossProfit,
+    companyExpenses: accounting.companyExpenses,
+    previousGoodsPurchases: accounting.goodsPurchases,
+    availableBefore: accounting.availablePurchaseFunds,
+    capitalUsed: 0,
+    profitUsed: 0,
+    availableAfter: after.availablePurchaseFunds,
+    calculatedAt: new Date(),
+  };
+}
+
+// Staff only need the spendable balance to prepare a purchase; category
+// profit and shareholder figures stay with the superadministrator.
+function fundsView(accounting, user) {
+  if (user?.role === "superadmin") return accounting;
+  return {
+    category: accounting.category,
+    basis: accounting.basis,
+    availablePurchaseFunds: accounting.availablePurchaseFunds,
+    fundingShortfall: accounting.fundingShortfall,
+  };
+}
 
 // ==================== MAIN EXPENSES ENDPOINT (TIME FRAME PAGINATION) ====================
 
@@ -420,7 +524,7 @@ router.get("/", authMiddleware, async (req, res) => {
     
     // 1. Apply timeframe filter (priority order handled in buildTimeframeFilter)
     try {
-      const timeframeFilter = buildTimeframeFilter(req.query);
+      const timeframeFilter = buildTimeframeFilter(visibleTimeframeQuery(req));
       Object.assign(filter, timeframeFilter);
     } catch (timeframeError) {
       return res.status(400).json({ 
@@ -493,7 +597,7 @@ router.get("/", authMiddleware, async (req, res) => {
 
     // Generate timeframe metadata
     const timeframeDescription = getTimeframeDescription(req.query);
-    const timeframeFilter = buildTimeframeFilter(req.query);
+    const timeframeFilter = buildTimeframeFilter(visibleTimeframeQuery(req));
 
     const totals = summaryResult[0] || {
       totalAmount: 0,
@@ -582,13 +686,56 @@ router.get("/", authMiddleware, async (req, res) => {
 
 // ==================== ALL OTHER ROUTES ====================
 
+function replayId(value) {
+  if (!value) return "";
+  return String(value._id || value);
+}
+
+function sameExpenseRequest(existing, expected) {
+  const textFields = ["expenseType", "category", "reason", "recipientName", "recipientPhone", "paymentMethod", "notes", "enteredCurrency"];
+  if (textFields.some((field) => String(existing[field] ?? "") !== String(expected[field] ?? ""))) return false;
+  if (replayId(existing.creditorId) !== replayId(expected.creditorId)) return false;
+  const numberFields = ["amountUSD", "enteredAmount", "exchangeRate"];
+  return numberFields.every((field) => {
+    const left = Number(existing[field] ?? (field === "amountUSD" ? existing.amount : 0));
+    const right = Number(expected[field] ?? (field === "amountUSD" ? expected.amount : 0));
+    return Number.isFinite(left) && Number.isFinite(right) && Math.abs(left - right) < 1e-9;
+  });
+}
+
+function requestReplay(existing, actorId, expected) {
+  if (String(existing.requestedBy) !== String(actorId)) {
+    return { status: 409, body: { error: "IDEMPOTENCY_CONFLICT", message: "Cette clé de requête appartient à une autre opération." } };
+  }
+  if (expected && !sameExpenseRequest(existing, expected)) {
+    return { status: 409, body: { error: "IDEMPOTENCY_CONFLICT", message: "Cette clé de requête a déjà été utilisée avec des données différentes." } };
+  }
+  return { status: 200, body: existing };
+}
+
+async function findRequestReplay(requestKey, actorId, expected) {
+  const existing = await Expense.findOne({ requestKey: sanitizeInput(requestKey).slice(0, 100) });
+  if (!existing) return null;
+  return requestReplay(existing, actorId, expected);
+}
+
 /** ---------- CREATE EXPENSE ---------- **/
 router.post("/", authMiddleware, async (req, res) => {
+  let replayExpectation = null;
   try {
     const { reason, recipientName, recipientPhone, amount, paymentMethod, notes, recordedBy } = req.body;
 
     // Validation
-    const isRepayment = req.body.expenseType === "repayment";
+    const expenseType = normalizedExpenseType(req.body.expenseType);
+    if (!expenseType) return res.status(400).json({ error: "expenseType must be COMPANY_EXPENSE or GOODS_PURCHASE" });
+    const isRepayment = expenseType === EXPENSE_TYPES.REPAYMENT;
+    const requestKey = sanitizeInput(req.body.requestKey).slice(0, 100) || undefined;
+    const actorId = req.user?._id || req.user?.id;
+    let category;
+    if (!isRepayment) {
+      try { category = assertCategory(String(req.body.category || "").toUpperCase()); }
+      catch (error) { return res.status(error.status || 400).json({ error: error.message }); }
+    }
     if (!reason || !recipientName || (!isRepayment && !recipientPhone) || !amount || (isRepayment && !req.body.creditorId)) {
       return res.status(400).json({ 
         error: "Reason, recipientName, recipientPhone, and amount are required" 
@@ -628,7 +775,6 @@ router.post("/", authMiddleware, async (req, res) => {
       if (!creditor) return res.status(400).json({ error: "Selected creditor is unavailable" });
       if (creditor.remainingBalance + 1e-9 < amountSnapshot.amountUSD) return res.status(409).json({ error: "Repayment exceeds the available debt" });
     }
-    const actorId = req.user?._id || req.user?.id;
     const autoValidate = req.user?.role === "superadmin";
     const now = new Date();
     const expenseData = {
@@ -641,7 +787,9 @@ router.post("/", authMiddleware, async (req, res) => {
       recordedBy: sanitizedRecordedBy,
       notes: sanitizedNotes,
       status: autoValidate ? "validated" : "pending",
-      expenseType: isRepayment ? "repayment" : "normal",
+      expenseType,
+      category,
+      requestKey,
       creditorId: creditor?._id || null,
       creditorSnapshot: creditor ? { name: creditor.name, type: creditor.type } : undefined,
       requestedBy: actorId,
@@ -650,11 +798,34 @@ router.post("/", authMiddleware, async (req, res) => {
       repaymentAppliedAt: autoValidate && isRepayment ? now : null,
       repaymentAppliedBy: autoValidate && isRepayment ? actorId : null
     };
+    replayExpectation = expenseData;
+
+    // Compare the complete normalized financial request, not only the key.
+    // Identical retries replay the authoritative record; key reuse with a
+    // different amount/type/category/payee is an explicit conflict.
+    if (requestKey) {
+      const replay = await findRequestReplay(requestKey, actorId, expenseData);
+      if (replay) return res.status(replay.status).json(replay.body);
+    }
 
     const session = await mongoose.startSession();
     let savedExpense;
+    let replayed = false;
     try {
       await session.withTransaction(async () => {
+        // Re-checked inside the transaction: a concurrent duplicate that
+        // committed first is replayed instead of being validated again.
+        if (requestKey) {
+          const existing = await Expense.findOne({ requestKey }).session(session);
+          if (existing) {
+            const replay = requestReplay(existing, actorId, expenseData);
+            if (replay.status !== 200) throw Object.assign(new Error(replay.body.message), { status: replay.status, code: replay.body.error });
+            savedExpense = existing;
+            replayed = true;
+            return;
+          }
+        }
+        replayed = false;
         if (autoValidate && isRepayment) {
           const updated = await Creditor.findOneAndUpdate(
             { _id: creditor._id, isActive: true, remainingBalance: { $gte: amountSnapshot.amountUSD } },
@@ -663,31 +834,143 @@ router.post("/", authMiddleware, async (req, res) => {
           );
           if (!updated) throw Object.assign(new Error("Repayment exceeds the available debt"), { status: 409 });
         }
+        if (autoValidate && !isRepayment) {
+          const draft = new Expense(expenseData);
+          await applyAccountingValidation(draft, session);
+          expenseData.fundingSource = draft.fundingSource;
+          expenseData.financialSnapshot = draft.financialSnapshot;
+        }
         [savedExpense] = await Expense.create([expenseData], { session });
       });
     } finally { await session.endSession(); }
+
+    if (replayed) {
+      if (String(savedExpense.requestedBy) !== String(actorId)) return res.status(409).json({ error: "Cette requête a déjà été utilisée" });
+      return res.status(200).json(savedExpense);
+    }
 
     // Send email notification
     if (!autoValidate) sendExpenseNotification(savedExpense);
 
     return res.status(201).json(savedExpense);
   } catch (error) {
-    console.error("Error creating expense:", error);
+    console.error("Error creating expense:", error.code === 11000
+      ? { code: error.code, keyPattern: error.keyPattern, keyValue: error.keyValue, message: error.message }
+      : error);
     if (error.name === "ValidationError") {
       const errors = Object.values(error.errors).map((e) => e.message);
       return res.status(400).json({ error: errors.join(", ") });
     }
-    if (error.code === 11000) {
-      return res.status(400).json({ error: "Expense ID already exists" });
+    if (error.code === 11000 && req.body?.requestKey) {
+      // A concurrent identical submission committed first: replay it.
+      const replay = await findRequestReplay(req.body.requestKey, req.user?._id || req.user?.id, replayExpectation);
+      if (replay) return res.status(replay.status).json(replay.body);
     }
-    return res.status(error.status || 500).json({ error: error.status ? error.message : "Failed to create expense" });
+    if (error.code === 11000) return duplicateKeyError(res, error);
+    return accountingError(res, error, "Failed to create expense");
+  }
+});
+
+/** ---------- AUTHORITATIVE REPLENISHMENT FUNDS (cumulative balance) ---------- **/
+router.get("/funds/:category", authMiddleware, async (req, res) => {
+  try {
+    const category = assertCategory(String(req.params.category || "").toUpperCase());
+    res.set("Cache-Control", "no-store");
+    res.json(fundsView(await aggregateCategoryAccounting(category), req.user));
+  } catch (error) {
+    accountingError(res, error, "Failed to calculate purchase funds");
+  }
+});
+
+/** ---------- AUDITABLE ACCOUNTING REVERSAL ---------- **/
+router.post("/:id/reverse", authMiddleware, async (req, res) => {
+  if (req.user?.role !== "superadmin") return res.status(403).json({ error: "Superadministrator access required" });
+  const reversalReason = sanitizeInput(req.body?.reason);
+  if (!reversalReason) return res.status(400).json({ error: "Reversal reason is required" });
+
+  const session = await mongoose.startSession();
+  try {
+    let reversal;
+    await session.withTransaction(async () => {
+      const original = await Expense.findOne({ _id: req.params.id }).session(session);
+      if (!original) throw Object.assign(new Error("Expense not found"), { status: 404 });
+      if (original.status !== "validated" || original.transactionKind === "REVERSAL" ||
+          ![EXPENSE_TYPES.COMPANY, EXPENSE_TYPES.GOODS].includes(original.expenseType)) {
+        throw Object.assign(new Error("Only validated company expenses or goods purchases can be reversed"), { status: 409 });
+      }
+      if (original.reversedBy) throw Object.assign(new Error("Transaction already reversed"), { status: 409 });
+
+      await acquireAccountingLock(original.category, session);
+      const accounting = await aggregateCategoryAccounting(original.category, { session });
+      const amount = Number(original.amountUSD ?? original.amount);
+      const capitalUsed = Number(original.financialSnapshot?.capitalUsed || 0);
+      const profitUsed = Number(original.financialSnapshot?.profitUsed || 0);
+      // The reversal mirrors the original's frozen funding split exactly.
+      const after = projectAccounting(accounting, original.expenseType === EXPENSE_TYPES.COMPANY
+        ? { companyExpenses: -amount }
+        : { goodsPurchases: -amount, capitalUsed: -capitalUsed, profitUsed: -profitUsed });
+      const reversalId = `REV-${Date.now()}-${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
+      [reversal] = await Expense.create([{
+        expenseId: reversalId,
+        reason: `Annulation: ${original.reason}`,
+        recipientName: original.recipientName,
+        recipientPhone: original.recipientPhone,
+        amount: original.amount,
+        enteredAmount: original.enteredAmount,
+        enteredCurrency: original.enteredCurrency,
+        amountUSD: original.amountUSD,
+        amountFC: original.amountFC,
+        exchangeRate: original.exchangeRate,
+        paymentMethod: original.paymentMethod,
+        status: "validated",
+        recordedBy: req.user.username,
+        validatedBy: req.user.username,
+        validatedAt: new Date(),
+        notes: `Reversal of ${original.expenseId}: ${reversalReason}`,
+        expenseType: original.expenseType,
+        category: original.category,
+        fundingSource: original.fundingSource,
+        transactionKind: "REVERSAL",
+        reversalOf: original._id,
+        reversalReason,
+        requestedBy: req.user._id,
+        financialSnapshot: {
+          generatedCapital: accounting.recoveredCapital,
+          grossProfit: accounting.grossProfit,
+          companyExpenses: accounting.companyExpenses,
+          previousGoodsPurchases: accounting.goodsPurchases,
+          availableBefore: accounting.availablePurchaseFunds,
+          capitalUsed,
+          profitUsed,
+          capitalUsedFC: original.financialSnapshot?.capitalUsedFC || 0,
+          profitUsedFC: original.financialSnapshot?.profitUsedFC || 0,
+          availableAfter: after.availablePurchaseFunds,
+          calculatedAt: new Date(),
+        },
+      }], { session });
+      const marked = await Expense.findOneAndUpdate(
+        { _id: original._id, reversedBy: null },
+        { $set: { reversedBy: reversal._id } },
+        { new: true, session }
+      );
+      if (!marked) throw Object.assign(new Error("Transaction already reversed"), { status: 409 });
+    });
+    return res.status(201).json(reversal);
+  } catch (error) {
+    if (error.code === 11000) return duplicateKeyError(res, error);
+    return accountingError(res, error, "Failed to reverse transaction");
+  } finally {
+    await session.endSession();
   }
 });
 
 /** ---------- GET EXPENSE BY ID ---------- **/
 router.get("/:id", authMiddleware, async (req, res) => {
   try {
-    const expense = await Expense.findById(req.params.id);
+    const expense = await Expense.findOne({
+      _id: req.params.id,
+      ...(["admin", "superadmin"].includes(req.user?.role) ? {} : buildTimeframeFilter({})),
+    });
     if (!expense) {
       return res.status(404).json({ error: "Expense not found" });
     }
@@ -737,7 +1020,8 @@ router.patch("/:id/validate", authMiddleware, async (req, res) => {
         if (!current) throw Object.assign(new Error("Expense not found"), { status: 404 });
         if (current.status === "validated") { updatedExpense = current; return; }
         if (current.status !== "pending") throw Object.assign(new Error("Cannot validate a rejected expense"), { status: 409 });
-        if (current.expenseType === "repayment") {
+        if (current.expenseType === "repayment") current.expenseType = EXPENSE_TYPES.REPAYMENT;
+        if (current.expenseType === EXPENSE_TYPES.REPAYMENT) {
           if (current.repaymentAppliedAt) throw Object.assign(new Error("Repayment was already applied"), { status: 409 });
           const creditor = await Creditor.findOneAndUpdate(
             { _id: current.creditorId, isActive: true, remainingBalance: { $gte: current.amountUSD } },
@@ -747,6 +1031,8 @@ router.patch("/:id/validate", authMiddleware, async (req, res) => {
           if (!creditor) throw Object.assign(new Error("Repayment exceeds the available debt or creditor is inactive"), { status: 409 });
           current.repaymentAppliedAt = now;
           current.repaymentAppliedBy = actorId;
+        } else {
+          await applyAccountingValidation(current, session);
         }
         current.status = "validated";
         current.validatedBy = validatedBy || req.user?.username || String(actorId);
@@ -762,7 +1048,7 @@ router.patch("/:id/validate", authMiddleware, async (req, res) => {
     if (error.name === "CastError") {
       return res.status(400).json({ error: "Invalid expense ID" });
     }
-    res.status(error.status || 500).json({ error: error.status ? error.message : "Failed to validate expense" });
+    accountingError(res, error, "Failed to validate expense");
   }
 });
 
@@ -796,8 +1082,10 @@ router.patch("/:id/reject", authMiddleware, async (req, res) => {
     const rejectionNotes = `Rejected: ${reason}${notes ? ` - ${notes}` : ''}`;
     const updatedNotes = expense.notes ? `${expense.notes}\n${rejectionNotes}` : rejectionNotes;
 
-    const updatedExpense = await Expense.findByIdAndUpdate(
-      req.params.id,
+    // Guarded on "pending": a concurrent validation must never be overwritten,
+    // or a spent purchase would silently give its funds back.
+    const updatedExpense = await Expense.findOneAndUpdate(
+      { _id: req.params.id, status: "pending" },
       {
         status: "rejected",
         validatedBy: req.user?.id || "Admin",
@@ -806,6 +1094,9 @@ router.patch("/:id/reject", authMiddleware, async (req, res) => {
       },
       { new: true, runValidators: true }
     );
+    if (!updatedExpense) {
+      return res.status(409).json({ error: "Expense status changed; refresh and retry" });
+    }
 
     res.json(updatedExpense);
   } catch (error) {
@@ -850,7 +1141,10 @@ router.put("/:id", authMiddleware, async (req, res) => {
     if (!existingExpense) {
       return res.status(404).json({ error: "Expense not found" });
     }
-    if (existingExpense.expenseType === "repayment") return res.status(409).json({ error: "Repayment expenses are immutable; reject a pending request and create a new one" });
+    if (["repayment", EXPENSE_TYPES.REPAYMENT].includes(existingExpense.expenseType)) return res.status(409).json({ error: "Repayment expenses are immutable; reject a pending request and create a new one" });
+    if (existingExpense.status === "validated" && [EXPENSE_TYPES.COMPANY, EXPENSE_TYPES.GOODS].includes(existingExpense.expenseType)) {
+      return res.status(409).json({ error: "Validated accounting transactions are immutable; create a correcting transaction" });
+    }
 
     // Authorization check for editing validated/rejected expenses
     if (existingExpense.status !== "pending") {
@@ -878,10 +1172,17 @@ router.put("/:id", authMiddleware, async (req, res) => {
       });
     }
 
+    // Money that already left the till keeps its historical amount, currency
+    // and exchange rate; only descriptive fields of a legacy cash-out change.
+    if (existingExpense.status === "validated" &&
+        Math.round(Number(existingExpense.amount) * 100) !== Math.round(expenseAmount * 100)) {
+      return res.status(409).json({ error: "The amount of a validated cash-out is immutable" });
+    }
+
     let amountSnapshot;
     try {
-      const hasExplicitSnapshot = Boolean(req.body.enteredCurrency);
-      const amountChanged = Number(existingExpense.amount) !== expenseAmount;
+      const hasExplicitSnapshot = Boolean(req.body.enteredCurrency) && existingExpense.status !== "validated";
+      const amountChanged = existingExpense.status !== "validated" && Number(existingExpense.amount) !== expenseAmount;
       amountSnapshot = hasExplicitSnapshot || amountChanged
         ? normalizeAmountSnapshot(
             req.body,
@@ -924,11 +1225,14 @@ router.put("/:id", authMiddleware, async (req, res) => {
       updateData.validatedAt = new Date();
     }
 
-    const updatedExpense = await Expense.findByIdAndUpdate(
-      req.params.id,
+    const updatedExpense = await Expense.findOneAndUpdate(
+      { _id: req.params.id, status: existingExpense.status },
       updateData,
       { new: true, runValidators: true }
     );
+    if (!updatedExpense) {
+      return res.status(409).json({ error: "Expense status changed; refresh and retry" });
+    }
 
     // Send update notification
     sendExpenseUpdateNotification(updatedExpense, req.user?.id || "Unknown", sanitizedUpdateReason);
@@ -964,7 +1268,10 @@ router.delete("/:id/admin", authMiddleware, async (req, res) => {
     if (!expense) {
       return res.status(404).json({ error: "Expense not found" });
     }
-    if (expense.expenseType === "repayment" && expense.repaymentAppliedAt) return res.status(409).json({ error: "Applied repayments cannot be deleted" });
+    if (["repayment", EXPENSE_TYPES.REPAYMENT].includes(expense.expenseType) && expense.repaymentAppliedAt) return res.status(409).json({ error: "Applied repayments cannot be deleted" });
+    if (expense.status === "validated" && [EXPENSE_TYPES.COMPANY, EXPENSE_TYPES.GOODS].includes(expense.expenseType)) return res.status(409).json({ error: "Validated accounting transactions cannot be deleted; create a correcting transaction" });
+    // A validated legacy cash-out is part of historical cash reporting.
+    if (expense.status === "validated") return res.status(409).json({ error: "Validated cash-outs cannot be deleted" });
 
     // Store expense info for response before deletion
     const deletedExpenseInfo = {
@@ -976,7 +1283,8 @@ router.delete("/:id/admin", authMiddleware, async (req, res) => {
       recipientName: expense.recipientName
     };
 
-    await Expense.findByIdAndDelete(req.params.id);
+    const deleted = await Expense.findOneAndDelete({ _id: req.params.id, status: expense.status });
+    if (!deleted) return res.status(409).json({ error: "Expense status changed; refresh and retry" });
 
     // Send deletion notification
     sendExpenseDeletionNotification(deletedExpenseInfo, req.user?.id || "Admin");
@@ -1017,7 +1325,8 @@ router.delete("/:id", authMiddleware, async (req, res) => {
       });
     }
 
-    await Expense.findByIdAndDelete(req.params.id);
+    const deleted = await Expense.findOneAndDelete({ _id: req.params.id, status: "pending" });
+    if (!deleted) return res.status(409).json({ error: "Expense status changed; refresh and retry" });
     res.json({ 
       message: "Expense deleted successfully",
       deletedExpense: {
@@ -1041,7 +1350,7 @@ router.get("/stats/summary", authMiddleware, async (req, res) => {
     // Build timeframe filter
     let timeframeFilter;
     try {
-      timeframeFilter = buildTimeframeFilter(req.query);
+      timeframeFilter = buildTimeframeFilter(visibleTimeframeQuery(req));
     } catch (timeframeError) {
       return res.status(400).json({ 
         error: timeframeError.message,
@@ -1162,7 +1471,10 @@ router.get("/stats/summary", authMiddleware, async (req, res) => {
 /** ---------- GET EXPENSE HISTORY/AUDIT LOG ---------- **/
 router.get("/:id/history", authMiddleware, async (req, res) => {
   try {
-    const expense = await Expense.findById(req.params.id);
+    const expense = await Expense.findOne({
+      _id: req.params.id,
+      ...(["admin", "superadmin"].includes(req.user?.role) ? {} : buildTimeframeFilter({})),
+    });
     if (!expense) {
       return res.status(404).json({ error: "Expense not found" });
     }
@@ -1205,7 +1517,7 @@ router.get("/recipient/:phone", authMiddleware, async (req, res) => {
     // Build timeframe filter
     let timeframeFilter;
     try {
-      timeframeFilter = buildTimeframeFilter(req.query);
+      timeframeFilter = buildTimeframeFilter(visibleTimeframeQuery(req));
     } catch (timeframeError) {
       return res.status(400).json({ 
         error: timeframeError.message,
@@ -1268,7 +1580,7 @@ router.get("/status/:status", authMiddleware, async (req, res) => {
     // Build timeframe filter
     let timeframeFilter;
     try {
-      timeframeFilter = buildTimeframeFilter(req.query);
+      timeframeFilter = buildTimeframeFilter(visibleTimeframeQuery(req));
     } catch (timeframeError) {
       return res.status(400).json({ 
         error: timeframeError.message,

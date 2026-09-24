@@ -260,6 +260,10 @@ saleSchema.index({ status: 1 });
 saleSchema.index({ type: 1, status: 1, createdAt: -1 });
 saleSchema.index({ paymentMethod: 1, createdAt: -1 });
 saleSchema.index({ customerId: 1, createdAt: -1 });
+// Category accounting: cumulative balances match by item category and status;
+// period reports recognize reservations on their completion date.
+saleSchema.index({ "items.mainCategory": 1, status: 1, type: 1, createdAt: -1 });
+saleSchema.index({ type: 1, status: 1, completedAt: -1 });
 
 // Pre-save middleware to calculate item totals (only for sales with items)
 saleSchema.pre("save", function(next) {

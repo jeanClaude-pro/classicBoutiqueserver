@@ -9,6 +9,7 @@
     "migrate:boutique-products": "node scripts/migrateBoutiqueProducts.js",
     "migrate:remove-receipt-verification": "node scripts/removeReceiptVerificationFields.js",
     "migrate:superadmin": "node scripts/migrateAdminsToSuperadmin.js",
+    "migrate:expense-accounting": "node scripts/migrateExpenseAccounting.js",
     "seed:categories": "node scripts/seedCategories.js"
   },
   "keywords": [

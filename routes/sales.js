@@ -12,6 +12,7 @@ const {
 } = require("../utils/salePricing");
 const {
   buildTimeframeFilter: buildBusinessTimeframeFilter,
+  currentBusinessDate,
   paginationMetadata,
   parsePagination,
 } = require("../utils/queryHelpers");
@@ -23,6 +24,8 @@ const {
 const { getFallbackExchangeRate } = require("../utils/currentExchangeRate");
 const { authorizedCategory, isShareholderAdmin } = require("../middleware/authorization");
 const { categoryRestrictedSaleStages } = require("../utils/categoryScope");
+const { acquireAccountingLocksForItems } = require("../services/financialAccountingService");
+const visibleTimeframeQuery = (req) => ["admin", "superadmin"].includes(req.user?.role) ? req.query : {};
 function safeSaleResponse(sale) {
   return typeof sale.toObject === "function" ? sale.toObject() : { ...sale };
 }
@@ -64,6 +67,43 @@ function financialSaleItem(product, pricing, quantity, priorItem = null) {
     quantity,
     mainCategory,
   });
+}
+
+const canReadHistory = (user) => ["admin", "superadmin"].includes(user?.role);
+
+// Other roles only reach records created during the current business day.
+function isWithinToday(date) {
+  const today = buildBusinessTimeframeFilter({}).createdAt;
+  const value = new Date(date);
+  return value >= today.$gte && value <= today.$lte;
+}
+
+// A completed sale is accounted as fully collected money. There is no
+// receivable model, so an unpaid ("credit") sale must be refused rather than
+// silently normalized to "other" and counted as recovered capital.
+const CREDIT_PAYMENT_METHODS = new Set(["credit", "crédit", "credit_sale", "debt", "dette", "on_account", "unpaid", "impayé", "impaye", "later"]);
+function assertCollectedPayment(paymentMethod) {
+  if (CREDIT_PAYMENT_METHODS.has(String(paymentMethod || "").trim().toLowerCase())) {
+    throw new HttpError(400, "Les ventes à crédit ne sont pas prises en charge : une vente doit être encaissée intégralement.");
+  }
+}
+
+function financialSummary(sale) {
+  return {
+    totalRevenue: sale.totalRevenue ?? sale.total,
+    costOfGoodsSold: sale.costOfGoodsSold,
+    grossProfit: sale.grossProfit,
+    items: (sale.items || []).map((item) => ({
+      productId: String(item.productId),
+      mainCategory: item.mainCategory,
+      quantity: item.quantity,
+      unitSellingPrice: item.unitSellingPrice ?? item.price,
+      unitAcquisitionCost: item.unitAcquisitionCost,
+      revenue: item.revenue,
+      costOfGoodsSold: item.costOfGoodsSold,
+      grossProfit: item.grossProfit,
+    })),
+  };
 }
 
 // normalize to the Sale model enum
@@ -387,7 +427,7 @@ router.get("/", authMiddleware, async (req, res) => {
     
     // 1. Apply timeframe filter (priority order handled in buildTimeframeFilter)
     try {
-      const timeframeFilter = buildTimeframeFilter(req.query);
+      const timeframeFilter = buildTimeframeFilter(visibleTimeframeQuery(req));
       Object.assign(filter, timeframeFilter);
     } catch (timeframeError) {
       return res.status(400).json({ 
@@ -526,7 +566,7 @@ router.get("/", authMiddleware, async (req, res) => {
     
     // Generate timeframe metadata
     const timeframeDescription = getTimeframeDescription(req.query);
-    const timeframeFilter = buildTimeframeFilter(req.query);
+    const timeframeFilter = buildTimeframeFilter(visibleTimeframeQuery(req));
     
     const totals = facet.summary?.[0] || {
       totalRevenue: 0,
@@ -645,12 +685,15 @@ router.get("/", authMiddleware, async (req, res) => {
 router.get("/stats/daily", authMiddleware, async (req, res) => {
   try {
     if (isShareholderAdmin(req.user)) return res.status(403).json({ error: "Use the authorized Sales History module" });
-    const { date } = req.query;
-    const targetDate = date ? new Date(date) : new Date();
-    const startOfDay = new Date(targetDate);
-    startOfDay.setHours(0, 0, 0, 0);
-    const endOfDay = new Date(targetDate);
-    endOfDay.setHours(23, 59, 59, 999);
+    const businessDate = canReadHistory(req.user) && req.query.date ? String(req.query.date) : currentBusinessDate();
+    let dayRange;
+    try {
+      dayRange = buildBusinessTimeframeFilter({ date: businessDate }).createdAt;
+    } catch (dateError) {
+      return res.status(400).json({ error: dateError.message });
+    }
+    const startOfDay = dayRange.$gte;
+    const endOfDay = dayRange.$lte;
 
     const dailySales = await Sale.aggregate([
       {
@@ -683,7 +726,7 @@ router.get("/stats/daily", authMiddleware, async (req, res) => {
     .lean();
 
     res.json({
-      date: targetDate.toISOString().split("T")[0],
+      date: businessDate,
       totalSales: dailySales[0]?.totalSales || 0,
       totalRevenue: dailySales[0]?.totalRevenue || 0,
       totalItems: dailySales[0]?.totalItems || 0,
@@ -769,6 +812,7 @@ router.post("/", authMiddleware, async (req, res) => {
     }
 
     // 🔹 HANDLE REGULAR SALE (existing logic)
+    assertCollectedPayment(paymentMethod);
     const walkIn = Boolean(isWalkIn);
     let transactionExchangeRate;
     try {
@@ -939,7 +983,7 @@ router.get("/expenses/all", authMiddleware, async (req, res) => {
     let timeframeFilter;
     try {
       timeframeFilter = buildBusinessTimeframeFilter(
-        req.query,
+        visibleTimeframeQuery(req),
         "createdAt",
         false
       );
@@ -1007,7 +1051,7 @@ router.get("/reservations/all", authMiddleware, async (req, res) => {
     let timeframeFilter;
     try {
       timeframeFilter = buildBusinessTimeframeFilter(
-        req.query,
+        visibleTimeframeQuery(req),
         "createdAt",
         false
       );
@@ -1129,7 +1173,10 @@ router.get("/:id", authMiddleware, async (req, res) => {
       ]);
       sale = rows[0] || null;
     } else {
-      sale = await Sale.findById(saleId).select("-__v").lean();
+      sale = await Sale.findOne({
+        _id: saleId,
+        ...(["admin", "superadmin"].includes(req.user?.role) ? {} : buildTimeframeFilter({})),
+      }).select("-__v").lean();
     }
     
     if (!sale) {
@@ -1195,8 +1242,13 @@ router.put("/:id", authMiddleware, async (req, res) => {
 
     // Find the original sale
     const originalSale = await Sale.findById(id).lean();
-    if (!originalSale) {
+    if (!originalSale || (!canReadHistory(req.user) && !isWithinToday(originalSale.createdAt))) {
       return res.status(404).json({ error: "Sale not found" });
+    }
+    // A correction never changes what kind of transaction this is: turning a
+    // sale into an expense (or back) would move money between ledgers.
+    if (type && type !== originalSale.type) {
+      return res.status(400).json({ error: "Transaction type cannot be changed by a correction" });
     }
 
     // 🔹 NEW: RESTRICTION FOR RESERVATIONS
@@ -1287,6 +1339,7 @@ router.put("/:id", authMiddleware, async (req, res) => {
     }
 
     // 🔹 HANDLE REGULAR SALE EDITING
+    assertCollectedPayment(paymentMethod);
     // Track changes for audit
     const changes = new Map();
 
@@ -1406,6 +1459,12 @@ router.put("/:id", authMiddleware, async (req, res) => {
       if (["voided", "corrected"].includes(currentSale.status)) {
         throw new HttpError(409, "Cannot edit a voided or corrected sale");
       }
+      // Correcting a recognized sale can reduce recovered capital, so it is
+      // serialized with purchase validations of the affected categories.
+      if (currentSale.status === "completed") {
+        await acquireAccountingLocksForItems([...(currentSale.items || []), ...enrichedItems], session);
+      }
+      changes.set("financials", { from: financialSummary(currentSale), to: financialSummary({ ...financialTotals, total, items: enrichedItems }) });
 
       const customerChanged =
         !walkIn && currentSale.customer?.phone !== customerData.phone;
@@ -1495,7 +1554,7 @@ router.patch("/:id/complete", authMiddleware, async (req, res) => {
     const { completedBy } = req.body;
 
     const sale = await Sale.findById(id).lean();
-    if (!sale) {
+    if (!sale || (!canReadHistory(req.user) && !isWithinToday(sale.createdAt))) {
       return res.status(404).json({ error: "Réservation non trouvée" });
     }
 
@@ -1515,6 +1574,7 @@ router.patch("/:id/complete", authMiddleware, async (req, res) => {
         status: "completed",
         completedAt: new Date(),
         completedBy: completedBy || req.user.userId,
+        $push: { editHistory: { editedBy: req.user.username, editedAt: new Date(), changes: { status: { from: "pending", to: "completed" } }, reason: "Reservation completed" } },
       },
       { new: true }
     );
@@ -1551,23 +1611,29 @@ router.patch("/:id/pending", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "This is not a reservation" });
     }
 
-    const updatedSale = await Sale.findOneAndUpdate(
-      { _id: id, type: "reservation", status: "completed" },
-      {
-        status: "pending",
-        completedAt: null,
-        completedBy: null,
-      },
-      { new: true }
-    );
-
-    if (!updatedSale) {
-      return res.status(409).json({ error: "Only a completed reservation can return to pending" });
-    }
+    // Un-recognizing a completed reservation removes recovered capital, so it
+    // runs under the category accounting lock like a purchase validation.
+    const updatedSale = await runTransaction(async (session) => {
+      const current = await Sale.findOne({ _id: id, type: "reservation", status: "completed" }).session(session).lean();
+      if (!current) throw new HttpError(409, "Only a completed reservation can return to pending");
+      await acquireAccountingLocksForItems(current.items, session);
+      const updated = await Sale.findOneAndUpdate(
+        { _id: id, type: "reservation", status: "completed" },
+        {
+          status: "pending",
+          completedAt: null,
+          completedBy: null,
+          $push: { editHistory: { editedBy: req.user.username, editedAt: new Date(), changes: { status: { from: "completed", to: "pending" }, completedAt: { from: current.completedAt, to: null } }, reason: "Reservation returned to pending" } },
+        },
+        { new: true, session }
+      );
+      if (!updated) throw new HttpError(409, "Only a completed reservation can return to pending");
+      return updated;
+    });
     res.json(updatedSale);
   } catch (error) {
     console.error("Error setting reservation to pending:", error);
-    res.status(500).json({ error: "Échec de la mise à jour de la réservation" });
+    return sendMutationError(res, error, "Échec de la mise à jour de la réservation");
   }
 });
 
@@ -1590,6 +1656,9 @@ router.patch("/:id/void", authMiddleware, async (req, res) => {
     if (sale.status === "voided") {
       throw new HttpError(409, "Sale is already voided");
     }
+    if (sale.status === "completed") {
+      await acquireAccountingLocksForItems(sale.items, session);
+    }
 
     // Return stock to inventory (only for sales and reservations with items)
     // ✅ FIXED: Check for reservation type as well
@@ -1606,8 +1675,8 @@ router.patch("/:id/void", authMiddleware, async (req, res) => {
       }
     }
 
-    const updatedSale = await Sale.findByIdAndUpdate(
-      id,
+    const updatedSale = await Sale.findOneAndUpdate(
+      { _id: id, status: sale.status },
       {
         status: "voided",
         voidedBy: req.user.userId,
@@ -1623,6 +1692,7 @@ router.patch("/:id/void", authMiddleware, async (req, res) => {
       },
       { new: true, session }
     );
+    if (!updatedSale) throw new HttpError(409, "Sale status changed; refresh and retry");
 
     // FIX: Recalculate customer stats after voiding (only for sales and reservations)
     if (sale.customerId && (sale.type === "sale" || sale.type === "reservation")) {
@@ -1662,6 +1732,11 @@ router.delete("/:id", authMiddleware, async (req, res) => {
     if (!sale) throw new HttpError(404, "Sale not found");
     if (sale.type === "reservation" && req.user.role !== "superadmin") {
       throw new HttpError(403, "Only admin can delete reservations");
+    }
+    // Deleting a recognized sale would erase revenue, recovered capital and
+    // profit from history. Voiding keeps an auditable record instead.
+    if (["sale", "reservation"].includes(sale.type) && sale.status === "completed") {
+      throw new HttpError(409, "Une vente comptabilisée ne peut pas être supprimée. Annulez-la d'abord.");
     }
     const customerId = sale.customerId;
     

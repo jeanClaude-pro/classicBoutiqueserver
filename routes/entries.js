@@ -10,6 +10,8 @@ const {
   paginationMetadata,
   parsePagination,
 } = require("../utils/queryHelpers");
+const BUSINESS_UTC_OFFSET_MS = 2 * 60 * 60 * 1000;
+const visibleTimeframeQuery = (req) => ["admin", "superadmin"].includes(req.user?.role) ? req.query : {};
 
 // ==================== TIME FRAME HELPER FUNCTIONS ====================
 
@@ -195,7 +197,7 @@ router.get("/", authMiddleware, async (req, res) => {
     
     // 1. Apply timeframe filter (priority order handled in buildTimeframeFilter)
     try {
-      const timeframeFilter = buildTimeframeFilter(req.query);
+      const timeframeFilter = buildTimeframeFilter(visibleTimeframeQuery(req));
       Object.assign(filter, timeframeFilter);
     } catch (timeframeError) {
       return res.status(400).json({ 
@@ -285,7 +287,7 @@ router.get("/", authMiddleware, async (req, res) => {
 
     // Generate timeframe metadata
     const timeframeDescription = getTimeframeDescription(req.query);
-    const timeframeFilter = buildTimeframeFilter(req.query);
+    const timeframeFilter = buildTimeframeFilter(visibleTimeframeQuery(req));
 
     const facet = summaryResult[0] || {};
     const totals = {
@@ -451,7 +453,10 @@ router.get("/:id", authMiddleware, async (req, res) => {
   try {
     const entryId = req.params.id;
     
-    const entry = await Entry.findById(entryId)
+    const entry = await Entry.findOne({
+      _id: entryId,
+      ...(["admin", "superadmin"].includes(req.user?.role) ? {} : buildTimeframeFilter({})),
+    })
       .populate("createdBy", "username email")
       .populate("updatedBy", "username")
       .populate("editHistory.editedBy", "username email");
@@ -732,12 +737,15 @@ router.patch("/:id/restore", authMiddleware, async (req, res) => {
 /** ---------- DAILY ENTRY STATS (like your sales stats) ---------- */
 router.get("/stats/daily", authMiddleware, async (req, res) => {
   try {
-    const { date } = req.query;
-    const targetDate = date ? new Date(date) : new Date();
-    const startOfDay = new Date(targetDate);
-    startOfDay.setHours(0, 0, 0, 0);
-    const endOfDay = new Date(targetDate);
-    endOfDay.setHours(23, 59, 59, 999);
+    // Business-timezone day; roles without history access always get today.
+    let dayRange;
+    try {
+      dayRange = buildTimeframeFilter(visibleTimeframeQuery(req).date ? { date: String(req.query.date) } : {}).createdAt;
+    } catch (dateError) {
+      return res.status(400).json({ error: dateError.message });
+    }
+    const startOfDay = dayRange.$gte;
+    const endOfDay = dayRange.$lte;
 
     const dailyEntries = await Entry.aggregate([
       {
@@ -785,7 +793,7 @@ router.get("/stats/daily", authMiddleware, async (req, res) => {
     }, {});
 
     res.json({
-      date: targetDate.toISOString().split("T")[0],
+      date: new Date(startOfDay.getTime() + BUSINESS_UTC_OFFSET_MS).toISOString().split("T")[0],
       totalEntries: dailyEntries[0]?.totalEntries || 0,
       totalAmount: dailyEntries[0]?.totalAmount || 0,
       categoryBreakdown,
@@ -804,7 +812,7 @@ router.get("/stats/summary", authMiddleware, async (req, res) => {
     // Build timeframe filter
     let timeframeFilter;
     try {
-      timeframeFilter = buildTimeframeFilter(req.query);
+      timeframeFilter = buildTimeframeFilter(visibleTimeframeQuery(req));
     } catch (timeframeError) {
       return res.status(400).json({ 
         error: timeframeError.message,
@@ -951,7 +959,7 @@ router.get("/category/:category", authMiddleware, async (req, res) => {
     // Build timeframe filter
     let timeframeFilter;
     try {
-      timeframeFilter = buildTimeframeFilter(req.query);
+      timeframeFilter = buildTimeframeFilter(visibleTimeframeQuery(req));
     } catch (timeframeError) {
       return res.status(400).json({ 
         error: timeframeError.message,
@@ -995,7 +1003,7 @@ router.get("/source/:source", authMiddleware, async (req, res) => {
     // Build timeframe filter
     let timeframeFilter;
     try {
-      timeframeFilter = buildTimeframeFilter(req.query);
+      timeframeFilter = buildTimeframeFilter(visibleTimeframeQuery(req));
     } catch (timeframeError) {
       return res.status(400).json({ 
         error: timeframeError.message,
@@ -1039,7 +1047,7 @@ router.get("/payment/:method", authMiddleware, async (req, res) => {
     // Build timeframe filter
     let timeframeFilter;
     try {
-      timeframeFilter = buildTimeframeFilter(req.query);
+      timeframeFilter = buildTimeframeFilter(visibleTimeframeQuery(req));
     } catch (timeframeError) {
       return res.status(400).json({ 
         error: timeframeError.message,
@@ -1081,7 +1089,7 @@ router.get("/user/me", authMiddleware, async (req, res) => {
     // Build timeframe filter
     let timeframeFilter;
     try {
-      timeframeFilter = buildTimeframeFilter(req.query);
+      timeframeFilter = buildTimeframeFilter(visibleTimeframeQuery(req));
     } catch (timeframeError) {
       return res.status(400).json({ 
         error: timeframeError.message,

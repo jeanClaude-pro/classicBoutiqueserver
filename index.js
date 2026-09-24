@@ -6,6 +6,8 @@ const morgan = require("morgan");
 const helmet = require("helmet");
 const { preventNoSqlInjection } = require("./middleware/security");
 const authMiddleware = require("./middleware/auth");
+const { ensureAccountingLocks } = require("./services/financialAccountingService");
+const { repairReversalIndex } = require("./scripts/migrateExpenseAccounting");
 const { MODULES, blockShareholderMutations, requireAssignedCategory, requireShareholderModule } = require("./middleware/authorization");
 
 const app = express();
@@ -132,7 +134,16 @@ app.use((error, _req, res, _next) => {
 // ====== DB + Server Startup ======
 mongoose
   .connect(MONGO_URI)
-  .then(() => {
+  .then(async () => {
+    await ensureAccountingLocks();
+    // Mongoose builds new indexes at boot but never drops obsolete ones; the
+    // legacy unique+sparse reversalOf_1 rejects every expense after the first.
+    try {
+      const { droppedBrokenReversalIndex } = await repairReversalIndex();
+      if (droppedBrokenReversalIndex) console.log("Dropped obsolete expenses index reversalOf_1");
+    } catch (error) {
+      console.error("Expense index repair failed:", error.message);
+    }
     console.log("✅ Connected to MongoDB Atlas");
     app.listen(PORT, () => {
       console.log(`🚀 Server running on port ${PORT}`);

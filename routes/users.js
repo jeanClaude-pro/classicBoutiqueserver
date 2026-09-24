@@ -94,6 +94,10 @@ router.put("/:userId/role", async (req, res) => {
     if (req.user.role !== "superadmin") {
       return res.status(403).json({ message: "Access denied. Superadmin role required." });
     }
+    // Demoting the signed-in superadministrator would remove its own access.
+    if (req.params.userId === req.user._id.toString()) {
+      return res.status(400).json({ message: "Vous ne pouvez pas modifier le rôle de votre propre compte" });
+    }
 
     const target = await User.findById(req.params.userId);
     if (!target) return res.status(404).json({ message: "User not found" });
@@ -143,6 +147,10 @@ router.put("/:userId/status", async (req, res) => {
   try {
     if (req.user.role !== "superadmin") {
       return res.status(403).json({ message: "Access denied. Superadmin role required." });
+    }
+    // Deactivating the signed-in account would lock it out on its next request.
+    if (req.params.userId === req.user._id.toString()) {
+      return res.status(400).json({ message: "Vous ne pouvez pas désactiver votre propre compte" });
     }
 
     const user = await User.findById(req.params.userId);
