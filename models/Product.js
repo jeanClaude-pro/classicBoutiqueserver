@@ -31,11 +31,16 @@ const productSchema = new mongoose.Schema(
       type: String,
       default: "",
     },
-    // price/unitCost remain the canonical USD figures every profit
-    // calculation reads from (unchanged semantics). The entered-currency
-    // fields alongside them are a display/input snapshot only, following the
-    // same enteredAmount/enteredCurrency/amountUSD/amountFC/exchangeRate
-    // pattern already used by Sale, Entry, Expense and Loan.
+    // Selling price: priceEnteredCurrency/priceEnteredAmount are the
+    // authoritative normal price (see productNormalPrice in
+    // utils/salePricing.js). A price defined as 20,000 FC stays 20,000 FC
+    // whatever the rate; `price` is then only its USD value at
+    // priceExchangeRate, and a new sale derives USD at its own rate. A USD
+    // price (or a legacy product without priceEnteredCurrency) keeps `price`
+    // exact and derives FC at the sale's rate.
+    // unitCost remains the canonical USD acquisition cost every profit
+    // calculation reads from; its entered-currency fields follow the same
+    // enteredAmount/enteredCurrency/amountFC/exchangeRate snapshot pattern.
     price: {
       type: Number,
       min: 0.01,

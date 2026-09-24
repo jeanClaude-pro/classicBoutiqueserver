@@ -10,7 +10,7 @@ function fcUnitPrice(item, saleRate) {
   if (item.enteredCurrency === 'FC' && Number.isFinite(Number(item.enteredPrice))) return Number(item.enteredPrice);
   if (Number.isFinite(Number(item.priceFC))) return Number(item.priceFC);
   const rate = Number(item.exchangeRate ?? saleRate);
-  const usd = Number(item.priceUSD ?? item.unitPrice ?? item.price);
+  const usd = Number(item.unitSellingPrice ?? item.priceUSD ?? item.unitPrice ?? item.price);
   return Number.isFinite(rate) && rate > 0 && Number.isFinite(usd) ? Math.round(usd * rate) : undefined;
 }
 
@@ -19,7 +19,7 @@ function formatFc(value) {
 }
 
 function dualItemAmount(item, quantity, saleRate) {
-  const usd = Number(item.priceUSD ?? item.unitPrice ?? item.price) * quantity;
+  const usd = Number(item.unitSellingPrice ?? item.priceUSD ?? item.unitPrice ?? item.price) * quantity;
   const fcUnit = fcUnitPrice(item, saleRate);
   return `${usd.toFixed(2)}$${fcUnit === undefined ? '' : ` / ${formatFc(fcUnit * quantity)}`}`;
 }

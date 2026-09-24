@@ -12,9 +12,21 @@ const {
 const {
   normalizeExchangeRate,
   convertEnteredAmount,
+  productPriceAuthority,
   SUPPORTED_CURRENCIES,
 } = require("../utils/salePricing");
 const { getFallbackExchangeRate } = require("../utils/currentExchangeRate");
+
+const canViewAcquisitionCosts = (user) => ["admin", "superadmin"].includes(user?.role);
+const acquisitionCostProjection = {
+  unitCost: 0,
+  unitCostEnteredAmount: 0,
+  unitCostEnteredCurrency: 0,
+  unitCostFC: 0,
+  unitCostExchangeRate: 0,
+  totalAcquisitionCost: 0,
+  totalAcquisitionCostFC: 0,
+};
 
 // unitCost/price stay the canonical USD figures every profit calculation
 // reads from (semantics unchanged). This mirrors normalizeAmountSnapshot
@@ -36,6 +48,23 @@ function normalizeProductMoney(fieldName, enteredAmount, enteredCurrency, exchan
   const { amountUSD, amountFC } = convertEnteredAmount(amount, currency, exchangeRate);
   return { amountUSD, enteredAmount: amount, enteredCurrency: currency, amountFC, exchangeRate };
 }
+
+// The amount the user defined, in the currency they defined it in. Legacy
+// costs without entered fields only ever had the USD unitCost.
+function unitCostAuthority(product) {
+  if (product?.unitCostEnteredCurrency === "FC") {
+    const fc = Number(product.unitCostEnteredAmount ?? product.unitCostFC);
+    if (Number.isFinite(fc)) return { currency: "FC", amount: fc };
+  }
+  return { currency: "USD", amount: Number(product?.unitCostEnteredAmount ?? product?.unitCost) };
+}
+
+// Re-submitting the same amount in the same currency (an edit form saved to
+// change the name or stock) is not a price change: the existing snapshot is
+// kept as-is instead of being re-derived at today's rate. Only a different
+// amount or currency makes the new entry authoritative.
+const isSameEntry = (authority, submitted) =>
+  authority.currency === submitted.enteredCurrency && authority.amount === submitted.enteredAmount;
 
 // unitCost is the acquisition cost of ONE piece, as entered by the user.
 // totalAcquisitionCost (the stock's total acquisition value) is always
@@ -61,13 +90,14 @@ async function financialProductFields(body, existing = null) {
     exchangeRate: existing?.priceExchangeRate,
   };
   if (priceTouched) {
-    price = normalizeProductMoney(
+    const submitted = normalizeProductMoney(
       "price",
       body.priceEnteredAmount ?? body.price,
       body.priceEnteredCurrency,
       body.priceExchangeRate,
       fallbackRate
     );
+    if (!existing || !isSameEntry(productPriceAuthority(existing), submitted)) price = submitted;
   }
 
   let unitCost = {
@@ -78,7 +108,7 @@ async function financialProductFields(body, existing = null) {
     exchangeRate: existing?.unitCostExchangeRate,
   };
   if (unitCostTouched) {
-    unitCost = normalizeProductMoney(
+    const submitted = normalizeProductMoney(
       "unitCost",
       body.unitCostEnteredAmount ?? body.unitCost,
       body.unitCostEnteredCurrency,
@@ -86,6 +116,7 @@ async function financialProductFields(body, existing = null) {
       fallbackRate,
       { allowZero: true }
     );
+    if (!existing || !isSameEntry(unitCostAuthority(existing), submitted)) unitCost = submitted;
   }
 
   const totalAcquisitionCost = calculateTotalAcquisitionValue(unitCost.amountUSD, purchasedQuantity);
@@ -138,7 +169,9 @@ router.get("/", authMiddleware, async (req, res) => {
       filter.status = status;
     }
 
-    const products = await Product.find(filter).sort({ createdAt: -1 });
+    const query = Product.find(filter).sort({ createdAt: -1 });
+    if (!canViewAcquisitionCosts(req.user)) query.select(acquisitionCostProjection);
+    const products = await query;
     res.json(products);
   } catch (error) {
     console.error("Error fetching products:", error);
@@ -149,10 +182,12 @@ router.get("/", authMiddleware, async (req, res) => {
 // GET /api/products/:id - Get a single product by ID
 router.get("/:id", authMiddleware, async (req, res) => {
   try {
-    const product = await Product.findOne({
+    const query = Product.findOne({
       _id: req.params.id,
       ...(isShareholderAdmin(req.user) ? { mainCategory: req.user.assignedCategory } : {}),
     });
+    if (!canViewAcquisitionCosts(req.user)) query.select(acquisitionCostProjection);
+    const product = await query;
 
     if (!product) {
       return res.status(404).json({ error: "Product not found" });

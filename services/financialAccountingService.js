@@ -153,6 +153,10 @@ function saleTotalsPipeline(category, range) {
   const itemRate = { $ifNull: ["$items.exchangeRate", { $ifNull: ["$exchangeRate", 0] }] };
   const revenueUSD = { $ifNull: ["$items.revenue", { $multiply: [{ $ifNull: ["$items.priceUSD", "$items.price"] }, "$items.quantity"] }] };
   const cogsUSD = { $ifNull: ["$items.costOfGoodsSold", 0] };
+  // Legacy lines without revenueFC use their exact FC unit snapshot before
+  // converting the cent-rounded USD revenue (20,000 FC must not become 20,007).
+  const unitPriceFC = { $cond: [{ $eq: ["$items.enteredCurrency", "FC"] }, "$items.enteredPrice", "$items.priceFC"] };
+  const legacyRevenueFC = { $ifNull: [{ $multiply: [unitPriceFC, "$items.quantity"] }, { $multiply: [revenueUSD, itemRate] }] };
   return [
     { $match: recognizedSaleMatch(category, range) },
     { $unwind: "$items" },
@@ -162,7 +166,7 @@ function saleTotalsPipeline(category, range) {
       cogsCents: centsExpr(cogsUSD),
       storedGrossCents: centsExpr("$items.grossProfit"),
       quantity: "$items.quantity",
-      revenueFC: { $ifNull: ["$items.revenueFC", { $multiply: [revenueUSD, itemRate] }] },
+      revenueFC: { $ifNull: ["$items.revenueFC", legacyRevenueFC] },
       cogsFC: { $ifNull: ["$items.costOfGoodsSoldFC", { $multiply: [cogsUSD, itemRate] }] },
     } },
     { $group: {

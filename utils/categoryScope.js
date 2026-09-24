@@ -3,8 +3,17 @@ const VALID_CATEGORIES = new Set(["CLOTHES", "SHOES"]);
 function historicalRate() {
   return { $ifNull: ["$items.exchangeRate", { $ifNull: ["$exchangeRate", 0] }] };
 }
+// Exact FC unit price of a line: the entered FC amount, else the FC snapshot.
+function unitPriceFC() {
+  return { $cond: [{ $eq: ["$items.enteredCurrency", "FC"] }, "$items.enteredPrice", "$items.priceFC"] };
+}
+// Legacy lines without revenueFC use their exact FC unit snapshot before ever
+// converting the cent-rounded USD revenue (which would drift 20,000 -> 20,007).
 function revenueFC() {
-  return { $ifNull: ["$items.revenueFC", { $multiply: [{ $ifNull: ["$items.revenue", 0] }, historicalRate()] }] };
+  return { $ifNull: ["$items.revenueFC", { $ifNull: [
+    { $multiply: [unitPriceFC(), "$items.quantity"] },
+    { $multiply: [{ $ifNull: ["$items.revenue", 0] }, historicalRate()] },
+  ] }] };
 }
 function cogsFC() {
   return { $ifNull: ["$items.costOfGoodsSoldFC", { $multiply: [{ $ifNull: ["$items.costOfGoodsSold", 0] }, historicalRate()] }] };

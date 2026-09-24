@@ -9,6 +9,7 @@ const authMiddleware = require("../middleware/auth");
 const {
   normalizeExchangeRate,
   normalizeSaleItemPricing,
+  productNormalPrice,
 } = require("../utils/salePricing");
 const {
   buildTimeframeFilter: buildBusinessTimeframeFilter,
@@ -18,6 +19,11 @@ const {
 } = require("../utils/queryHelpers");
 const { buildStockAdjustments } = require("../utils/stockCalculations");
 const {
+  DiscountValidationError,
+  totalPhysicalQuantity,
+  validateUnitSellingPrice,
+} = require("../utils/discountCalculations");
+const {
   calculateProfitSnapshot,
   sumFinancialSnapshots,
 } = require("../utils/profitCalculations");
@@ -25,9 +31,32 @@ const { getFallbackExchangeRate } = require("../utils/currentExchangeRate");
 const { authorizedCategory, isShareholderAdmin } = require("../middleware/authorization");
 const { categoryRestrictedSaleStages } = require("../utils/categoryScope");
 const { acquireAccountingLocksForItems } = require("../services/financialAccountingService");
+const { discountProbeGuard } = require("../utils/discountProbeGuard");
+class HttpError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
 const visibleTimeframeQuery = (req) => ["admin", "superadmin"].includes(req.user?.role) ? req.query : {};
-function safeSaleResponse(sale) {
-  return typeof sale.toObject === "function" ? sale.toObject() : { ...sale };
+const PROTECTED_SALE_FIELDS = [
+  "unitAcquisitionCost", "unitAcquisitionCostFC", "costOfGoodsSold", "costOfGoodsSoldFC",
+  "grossProfit", "grossProfitFC", "clothesShareholderProfit", "shoeShareholder1Profit",
+  "shoeShareholder2Profit", "clothesShareholderProfitFC", "shoeShareholder1ProfitFC",
+  "shoeShareholder2ProfitFC", "shopProfit", "partnerProfit",
+];
+const canViewProtectedFinancials = (user) => ["admin", "superadmin"].includes(user?.role);
+function safeSaleResponse(sale, user) {
+  const value = typeof sale.toObject === "function" ? sale.toObject() : { ...sale };
+  if (canViewProtectedFinancials(user)) return value;
+  for (const field of PROTECTED_SALE_FIELDS) delete value[field];
+  value.items = (value.items || []).map((item) => {
+    const safeItem = typeof item.toObject === "function" ? item.toObject() : { ...item };
+    for (const field of PROTECTED_SALE_FIELDS) delete safeItem[field];
+    return safeItem;
+  });
+  return value;
 }
 
 // Historical shareholder reporting is derived from immutable sale-item
@@ -42,6 +71,23 @@ const itemShareholderExpressions = {
   },
   shoeShareholder2Profit: {
     $ifNull: ["$items.shoeShareholder2Profit", { $cond: [{ $eq: ["$items.mainCategory", "SHOES"] }, { $divide: [{ $ifNull: ["$items.grossProfit", 0] }, 2] }, 0] }],
+  },
+};
+
+// FC revenue of a sale recorded before totalRevenueFC existed: each line's
+// exact FC snapshot first, else its USD revenue at the line's own historical
+// rate. Today's rate is never involved.
+const legacySaleRevenueFC = {
+  $reduce: {
+    input: { $ifNull: ["$items", []] },
+    initialValue: 0,
+    in: { $add: ["$$value", { $ifNull: ["$$this.revenueFC", { $ifNull: [
+      { $multiply: [{ $cond: [{ $eq: ["$$this.enteredCurrency", "FC"] }, "$$this.enteredPrice", "$$this.priceFC"] }, "$$this.quantity"] },
+      { $multiply: [
+        { $ifNull: ["$$this.revenue", { $ifNull: ["$$this.total", 0] }] },
+        { $ifNull: ["$$this.exchangeRate", { $ifNull: ["$exchangeRate", 0] }] },
+      ] },
+    ] }] }] },
   },
 };
 
@@ -67,6 +113,192 @@ function financialSaleItem(product, pricing, quantity, priorItem = null) {
     quantity,
     mainCategory,
   });
+}
+
+// A new line's normal price comes from the Product's authoritative currency
+// at the transaction rate (productNormalPrice). A correction must not
+// reinterpret a legacy custom price as a newly found discount: existing lines
+// use their saved reference when available, or their own historical actual
+// price as the backward-compatible reference — never today's Product price.
+function referencePricing(product, rate, priorItem = null) {
+  if (!priorItem) {
+    const normal = productNormalPrice(product, rate);
+    return { usd: normal.usd, fc: normal.fc };
+  }
+  if (priorItem.referenceUnitSellingPrice !== undefined) {
+    return {
+      usd: priorItem.referenceUnitSellingPrice,
+      fc: priorItem.referenceUnitSellingPriceFC ??
+        (rate ? Math.round(priorItem.referenceUnitSellingPrice * rate) : undefined),
+    };
+  }
+  const usd = priorItem.unitSellingPrice ?? priorItem.priceUSD ?? priorItem.price;
+  const ownFC = priorItem.enteredCurrency === "FC" ? priorItem.enteredPrice : priorItem.priceFC;
+  return { usd, fc: ownFC ?? (rate ? Math.round(usd * rate) : undefined) };
+}
+
+function discountSnapshot(product, pricing, cartQuantity, rate, priorItem = null, { discountLimited = false } = {}) {
+  const reference = referencePricing(product, rate, priorItem);
+  const enteredInFC = pricing.enteredCurrency === "FC";
+  let result;
+  try {
+    result = validateUnitSellingPrice({
+      actualUnitPrice: pricing.price,
+      referenceUnitPrice: reference.usd,
+      unitAcquisitionCost: priorItem?.unitAcquisitionCost ?? product.unitCost,
+      cartQuantity,
+      ...(enteredInFC ? { actualUnitPriceFC: pricing.priceFC, referenceUnitPriceFC: reference.fc } : {}),
+    });
+  } catch (error) {
+    // While limited, a reduced price gets the same answer above or below the
+    // floor, so it can no longer be located by trial and error.
+    if (discountLimited && error.code === "PRICE_TOO_LOW") throw discountAttemptsLimitedError();
+    throw error;
+  }
+  if (discountLimited && result.discountApplied) throw discountAttemptsLimitedError();
+  const actualFC = pricing.priceFC;
+  return {
+    discountApplied: result.discountApplied,
+    referenceUnitSellingPrice: result.referenceUnitSellingPrice,
+    discountPerUnit: result.discountPerUnit,
+    referenceUnitSellingPriceFC: reference.fc,
+    discountPerUnitFC: result.discountPerUnitFC ?? (
+      result.discountApplied && reference.fc !== undefined && actualFC !== undefined
+        ? Math.max(0, reference.fc - actualFC)
+        : 0
+    ),
+  };
+}
+
+function discountAttemptsLimitedError() {
+  const error = new DiscountValidationError(
+    "DISCOUNT_ATTEMPTS_LIMITED",
+    "Trop de remises refusées. Vendez au prix normal ou réessayez plus tard."
+  );
+  error.status = 429;
+  return error;
+}
+
+// Key of a user subject to the probing guard; roles that can already read
+// acquisition costs have nothing to discover and are never limited.
+const discountProbeKey = (user) =>
+  user && !canViewProtectedFinancials(user) ? String(user._id ?? user.username) : null;
+
+function recordDiscountRejection(user, error) {
+  if (error.code !== "PRICE_TOO_LOW") return;
+  if (discountProbeGuard.recordRejection(discountProbeKey(user))) {
+    console.warn("Discount attempts limited after repeated refusals", { user: user?.username });
+  }
+}
+
+// Validates and prices every line with authoritative data only: the Product
+// (or, for a correction, the line's own immutable snapshot), the server-side
+// exchange rate and the whole-cart quantity. Nothing is written here, so a
+// rejected discount can never leave a partial stock or sale mutation behind.
+async function priceSaleItems(items, { saleRate, priorSale = null, checkStock = false, user = null }) {
+  if (!items || !Array.isArray(items) || items.length === 0) {
+    throw new HttpError(400, "Sale must contain at least one item");
+  }
+  let cartQuantity;
+  try {
+    cartQuantity = totalPhysicalQuantity(items);
+  } catch (quantityError) {
+    throw new HttpError(400, quantityError.message);
+  }
+
+  const discountLimited = discountProbeGuard.isLimited(discountProbeKey(user));
+  const enrichedItems = [];
+  for (const [itemIndex, item] of items.entries()) {
+    const { productId, quantity, price, name } = item || {};
+    if (!productId || !quantity || quantity <= 0 || !price || price < 0) {
+      throw new HttpError(400, "Each item requires productId, quantity>0, and price>=0");
+    }
+
+    const product = await Product.findById(productId).lean();
+    if (!product) throw new HttpError(400, `Product not found: ${productId}`);
+
+    if (checkStock && (typeof product.stock !== "number" || product.stock < quantity)) {
+      throw new HttpError(400, `Insufficient stock for ${product.name || name || productId}. Available: ${product.stock ?? 0}`);
+    }
+
+    const priorItem = priorSale?.items?.find((candidate) =>
+      String(candidate.productId) === String(productId) &&
+      ((item._id && String(candidate._id) === String(item._id)) || !item._id)
+    ) ?? null;
+    // Client-supplied rates are never trusted: an existing line keeps its own
+    // historical rate, every other line uses the transaction's rate.
+    const itemRate = priorItem?.exchangeRate ?? saleRate;
+
+    let pricing;
+    let financials;
+    let discount;
+    try {
+      pricing = normalizeSaleItemPricing({ ...item, exchangeRate: itemRate }, itemRate);
+      financials = financialSaleItem(product, pricing, Number(quantity), priorItem);
+      discount = discountSnapshot(product, pricing, cartQuantity, itemRate, priorItem, { discountLimited });
+    } catch (pricingError) {
+      if (pricingError instanceof DiscountValidationError) {
+        pricingError.itemIndex = itemIndex;
+        throw pricingError;
+      }
+      if (pricingError instanceof HttpError) throw pricingError;
+      throw new HttpError(400, pricingError.message);
+    }
+
+    enrichedItems.push({
+      productId: new mongoose.Types.ObjectId(productId),
+      name: name || product.name,
+      quantity: Number(quantity),
+      // The exact entered-currency snapshot. The separately stored
+      // unitSellingPrice is the cent-rounded accounting value used by revenue.
+      ...pricing,
+      total: financials.revenue,
+      ...discount,
+      ...financials,
+    });
+  }
+  return enrichedItems;
+}
+
+class ExchangeRateMismatchError extends HttpError {
+  constructor(activeRate) {
+    super(409, "Le taux de change a changé. Vérifiez les prix du panier puis réessayez.");
+    this.code = "EXCHANGE_RATE_CHANGED";
+    this.activeRate = activeRate;
+  }
+}
+
+// A new transaction always uses the rate active on the server. A client that
+// priced its cart at another rate (stale page, or a forged request trying to
+// shrink the USD value of an FC price) is refused instead of being trusted.
+async function resolveNewSaleExchangeRate(body) {
+  const activeRate = normalizeExchangeRate(await getFallbackExchangeRate());
+  const claimedRates = [body.exchangeRate, ...(Array.isArray(body.items) ? body.items.map((item) => item?.exchangeRate) : [])]
+    .filter((rate) => rate !== undefined && rate !== null && rate !== "");
+  for (const claimed of claimedRates) {
+    if (Number(claimed) !== Number(activeRate)) throw new ExchangeRateMismatchError(activeRate);
+  }
+  return activeRate;
+}
+
+function sendDiscountError(res, error) {
+  // The protected floor, cost and margin are never part of the response.
+  return res.status(error.status ?? 400).json({ error: error.code, message: error.message, itemIndex: error.itemIndex });
+}
+
+// Items identify a sale request for idempotent replay: the same key with a
+// different cart is a conflict, never a silent second sale.
+const saleRequestFingerprint = (items = []) => JSON.stringify(
+  (Array.isArray(items) ? items : []).map((item) => [String(item?.productId), Number(item?.quantity)]).sort()
+);
+const saleRequestKey = (body) => typeof body?.requestKey === "string"
+  ? body.requestKey.trim().slice(0, 100) || undefined
+  : undefined;
+function replaySaleRequest(res, req, existing) {
+  if (saleRequestFingerprint(existing.items) !== saleRequestFingerprint(req.body.items)) {
+    return res.status(409).json({ error: "IDEMPOTENCY_CONFLICT", message: "Cette clé de requête a déjà été utilisée avec des données différentes." });
+  }
+  return res.status(200).json(safeSaleResponse(existing, req.user));
 }
 
 const canReadHistory = (user) => ["admin", "superadmin"].includes(user?.role);
@@ -215,13 +447,6 @@ async function recalculateCustomerStats(customerId, session = null) {
   }
 }
 
-class HttpError extends Error {
-  constructor(status, message) {
-    super(message);
-    this.status = status;
-  }
-}
-
 function isTransactionUnsupported(error) {
   return error?.code === 20 ||
     /transaction numbers are only allowed|replica set member or mongos/i.test(error?.message || "");
@@ -241,7 +466,15 @@ async function runTransaction(work) {
 }
 
 function sendMutationError(res, error, fallbackMessage) {
+  if (error instanceof DiscountValidationError) return sendDiscountError(res, error);
   if (error instanceof HttpError) {
+    if (error.code) {
+      return res.status(error.status).json({
+        error: error.code,
+        message: error.message,
+        ...(error.activeRate !== undefined ? { exchangeRate: error.activeRate } : {}),
+      });
+    }
     return res.status(error.status).json({ error: error.message });
   }
   if (isTransactionUnsupported(error)) {
@@ -487,11 +720,20 @@ router.get("/", authMiddleware, async (req, res) => {
             { $sort: { createdAt: -1, _id: -1 } },
             { $skip: skip },
             { $limit: limit },
-            {
-              $project: {
-                __v: 0,
-              },
-            },
+            { $project: canViewProtectedFinancials(req.user) ? { __v: 0 } : {
+              __v: 0,
+              costOfGoodsSold: 0, costOfGoodsSoldFC: 0, grossProfit: 0, grossProfitFC: 0,
+              clothesShareholderProfit: 0, shoeShareholder1Profit: 0, shoeShareholder2Profit: 0,
+              clothesShareholderProfitFC: 0, shoeShareholder1ProfitFC: 0, shoeShareholder2ProfitFC: 0,
+              shopProfit: 0, partnerProfit: 0,
+              "items.unitAcquisitionCost": 0, "items.unitAcquisitionCostFC": 0,
+              "items.costOfGoodsSold": 0, "items.costOfGoodsSoldFC": 0,
+              "items.grossProfit": 0, "items.grossProfitFC": 0,
+              "items.clothesShareholderProfit": 0, "items.shoeShareholder1Profit": 0,
+              "items.shoeShareholder2Profit": 0, "items.clothesShareholderProfitFC": 0,
+              "items.shoeShareholder1ProfitFC": 0, "items.shoeShareholder2ProfitFC": 0,
+              "items.shopProfit": 0, "items.partnerProfit": 0,
+            } },
           ],
           metadata: [{ $count: "totalRecords" }],
           profitSummary: [
@@ -518,6 +760,15 @@ router.get("/", authMiddleware, async (req, res) => {
                   $cond: [
                     { $and: [{ $ne: ["$type", "expense"] }, { $eq: ["$status", "completed"] }] },
                     "$total",
+                    0,
+                  ],
+                },
+              },
+              totalRevenueFC: {
+                $sum: {
+                  $cond: [
+                    { $and: [{ $ne: ["$type", "expense"] }, { $eq: ["$status", "completed"] }] },
+                    { $ifNull: ["$totalRevenueFC", legacySaleRevenueFC] },
                     0,
                   ],
                 },
@@ -570,6 +821,7 @@ router.get("/", authMiddleware, async (req, res) => {
     
     const totals = facet.summary?.[0] || {
       totalRevenue: 0,
+      totalRevenueFC: 0,
       costOfGoodsSold: 0,
       grossProfit: 0,
       shopProfit: 0,
@@ -608,6 +860,7 @@ router.get("/", authMiddleware, async (req, res) => {
       summary: {
         totalRecords: total,
         revenue: totals.totalRevenue,
+        revenueFC: totals.totalRevenueFC,
         costOfGoodsSold: shareholderTotals.costOfGoodsSold,
         grossProfit: shareholderTotals.grossProfit,
         clothesShareholderProfit: shareholderTotals.clothesShareholderProfit,
@@ -617,6 +870,7 @@ router.get("/", authMiddleware, async (req, res) => {
         partnerProfit: totals.partnerProfit,
         expenses: totals.totalExpenses,
         net: totals.totalRevenue - totals.totalExpenses,
+        netFC: totals.totalRevenueFC,
         salesCount: totals.saleCount,
         expensesCount: totals.expenseCount,
         completedCount: totals.completedCount,
@@ -640,6 +894,7 @@ router.get("/", authMiddleware, async (req, res) => {
       response.summary = {
         totalRecords: total,
         revenue: totals.totalRevenue,
+        revenueFC: totals.totalRevenueFC,
         costOfGoodsSold: shareholderTotals.costOfGoodsSold,
         grossProfit: shareholderTotals.grossProfit,
         shareholderEntitlement: category === "CLOTHES"
@@ -730,7 +985,7 @@ router.get("/stats/daily", authMiddleware, async (req, res) => {
       totalSales: dailySales[0]?.totalSales || 0,
       totalRevenue: dailySales[0]?.totalRevenue || 0,
       totalItems: dailySales[0]?.totalItems || 0,
-      sales,
+      sales: sales.map((sale) => safeSaleResponse(sale, req.user)),
     });
   } catch (error) {
     console.error("Error fetching daily stats:", error);
@@ -751,7 +1006,6 @@ router.post("/", authMiddleware, async (req, res) => {
       reservationTime,
       notes,
       isWalkIn,
-      exchangeRate,
       // 🔹 NEW EXPENSE FIELDS
       reason,
       recipientName,
@@ -814,13 +1068,16 @@ router.post("/", authMiddleware, async (req, res) => {
     // 🔹 HANDLE REGULAR SALE (existing logic)
     assertCollectedPayment(paymentMethod);
     const walkIn = Boolean(isWalkIn);
-    let transactionExchangeRate;
-    try {
-      transactionExchangeRate =
-        normalizeExchangeRate(exchangeRate) ?? (await getFallbackExchangeRate());
-    } catch (pricingError) {
-      return res.status(400).json({ error: pricingError.message });
+    const requestKey = saleRequestKey(req.body);
+
+    // A retry of a sale that was already recorded (lost response, double
+    // submission) replays that sale before anything is re-validated.
+    if (requestKey) {
+      const existing = await Sale.findOne({ requestKey }).lean();
+      if (existing) return replaySaleRequest(res, req, existing);
     }
+
+    const transactionExchangeRate = await resolveNewSaleExchangeRate(req.body);
 
     if (walkIn && type === "reservation") {
       return res.status(400).json({
@@ -833,72 +1090,15 @@ router.post("/", authMiddleware, async (req, res) => {
         .status(400)
         .json({ error: "Customer name is required" });
     }
-    if (!items || !Array.isArray(items) || items.length === 0) {
-      return res
-        .status(400)
-        .json({ error: "Sale must contain at least one item" });
-    }
 
-    let subtotal = 0;
-    const enrichedItems = [];
-    for (const item of items) {
-      const { productId, quantity, price, name } = item || {};
-      if (!productId || !quantity || quantity <= 0 || !price || price < 0) {
-        return res.status(400).json({
-          error: "Each item requires productId, quantity>0, and price>=0",
-        });
-      }
-
-      const product = await Product.findById(productId).lean();
-      if (!product)
-        return res
-          .status(400)
-          .json({ error: `Product not found: ${productId}` });
-
-      if (typeof product.stock !== "number" || product.stock < quantity) {
-        return res.status(400).json({
-          error: `Insufficient stock for ${
-            product.name || name || productId
-          }. Available: ${product.stock ?? 0}`,
-        });
-      }
-
-      let pricing;
-      try {
-        pricing = normalizeSaleItemPricing(item, transactionExchangeRate);
-      } catch (pricingError) {
-        return res.status(400).json({ error: pricingError.message });
-      }
-
-      let financials;
-      try {
-        financials = financialSaleItem(product, pricing, Number(quantity));
-      } catch (financialError) {
-        if (financialError instanceof HttpError) throw financialError;
-        return res.status(400).json({ error: financialError.message });
-      }
-      const normalizedPricing = {
-        ...pricing,
-        price: financials.unitSellingPrice,
-        ...(pricing.priceUSD !== undefined
-          ? { priceUSD: financials.unitSellingPrice }
-          : {}),
-      };
-      const lineTotal = financials.revenue;
-      subtotal += lineTotal;
-
-      enrichedItems.push({
-        productId: new mongoose.Types.ObjectId(productId),
-        name: name || product.name,
-        quantity: Number(quantity),
-        ...normalizedPricing,
-        total: lineTotal,
-        ...financials,
-      });
-    }
+    const enrichedItems = await priceSaleItems(items, {
+      saleRate: transactionExchangeRate,
+      checkStock: true,
+      user: req.user,
+    });
 
     const financialTotals = sumFinancialSnapshots(enrichedItems);
-    subtotal = financialTotals.totalRevenue;
+    const subtotal = financialTotals.totalRevenue;
     const total = subtotal;
     const saleId = `SALE-${Date.now()}-${Math.random()
       .toString(36)
@@ -936,9 +1136,16 @@ router.post("/", authMiddleware, async (req, res) => {
       reservationDate: reservationDate || null,
       reservationTime: reservationTime || null,
       notes: notes || "",
+      requestKey,
     };
 
     const savedSale = await runTransaction(async (session) => {
+      // Re-checked inside the transaction: a concurrent identical submission
+      // that committed first is replayed instead of creating a second sale.
+      if (requestKey) {
+        const existing = await Sale.findOne({ requestKey }).session(session).lean();
+        if (existing) return { replayed: existing };
+      }
       // Walk-in sales never create or update a Customer record.
       saleData.customerId = walkIn
         ? null
@@ -962,8 +1169,21 @@ router.post("/", authMiddleware, async (req, res) => {
       return createdSales[0];
     });
 
-    return res.status(201).json(safeSaleResponse(savedSale));
+    if (savedSale.replayed) return replaySaleRequest(res, req, savedSale.replayed);
+    return res.status(201).json(safeSaleResponse(savedSale, req.user));
   } catch (error) {
+    const requestKey = saleRequestKey(req.body);
+    if (error?.code === 11000 && requestKey && /requestKey/.test(error.message || "")) {
+      // A concurrent identical submission committed first: replay it.
+      const existing = await Sale.findOne({ requestKey }).lean();
+      if (existing) return replaySaleRequest(res, req, existing);
+    }
+    if (error instanceof DiscountValidationError) {
+      // Audit trail of refused discounts; the floor itself is never logged.
+      console.warn("Sale discount rejected", { user: req.user?.username, code: error.code, itemIndex: error.itemIndex });
+      recordDiscountRejection(req.user, error);
+      return sendDiscountError(res, error);
+    }
     console.error("Error creating sale/expense:", error);
     return sendMutationError(res, error, "Failed to create sale/expense");
   }
@@ -1137,7 +1357,7 @@ router.get("/reservations/all", authMiddleware, async (req, res) => {
 
     res.json({
       success: true,
-      data: reservations,
+      data: reservations.map((sale) => safeSaleResponse(sale, req.user)),
       pagination: paginationMetadata(page, limit, total),
       summary: {
         totalReservations: summary.totalReservations,
@@ -1200,7 +1420,7 @@ router.get("/:id", authMiddleware, async (req, res) => {
 
     res.json({
       success: true,
-      data: sale,
+      data: safeSaleResponse(sale, req.user),
       duplicates: {
         count: duplicateCount,
         items: potentialDuplicates
@@ -1233,7 +1453,6 @@ router.put("/:id", authMiddleware, async (req, res) => {
       reservationTime,
       notes,
       isWalkIn,
-      exchangeRate,
       // Expense fields
       recipientName,
       recipientPhone,
@@ -1347,14 +1566,12 @@ router.put("/:id", authMiddleware, async (req, res) => {
     // sale's existing flag when the client doesn't include it in the payload.
     const walkIn = typeof isWalkIn === "boolean" ? isWalkIn : Boolean(originalSale.isWalkIn);
     const effectiveType = type || originalSale.type;
-    let transactionExchangeRate;
-    try {
-      transactionExchangeRate =
-        normalizeExchangeRate(exchangeRate ?? originalSale.exchangeRate) ??
-        (await getFallbackExchangeRate());
-    } catch (pricingError) {
-      return res.status(400).json({ error: pricingError.message });
-    }
+    // A correction belongs to the original transaction: its saved rate is
+    // authoritative and a client-sent rate is ignored. Only a legacy sale
+    // that never had a snapshot falls back to the rate active today.
+    const transactionExchangeRate =
+      normalizeExchangeRate(originalSale.exchangeRate) ??
+      normalizeExchangeRate(await getFallbackExchangeRate());
 
     if (walkIn && effectiveType === "reservation") {
       return res.status(400).json({
@@ -1378,62 +1595,17 @@ router.put("/:id", authMiddleware, async (req, res) => {
     // - a walk-in being converted to an identified sale gets linked here
     let newCustomerId = walkIn ? null : originalSale.customerId || null;
 
-    // Validate and process items
-    let subtotal = 0;
-    const enrichedItems = [];
-    
-    for (const item of items) {
-      const { productId, quantity, price, name } = item || {};
-      if (!productId || !quantity || quantity <= 0 || !price || price < 0) {
-        return res.status(400).json({
-          error: "Each item requires productId, quantity>0, and price>=0",
-        });
-      }
-
-      const product = await Product.findById(productId).lean();
-      if (!product) {
-        return res.status(400).json({ error: `Product not found: ${productId}` });
-      }
-
-      let pricing;
-      try {
-        pricing = normalizeSaleItemPricing(item, transactionExchangeRate);
-      } catch (pricingError) {
-        return res.status(400).json({ error: pricingError.message });
-      }
-
-      const priorItem = originalSale.items?.find(
-        (candidate) => String(candidate.productId) === String(productId)
-      );
-      let financials;
-      try {
-        financials = financialSaleItem(product, pricing, Number(quantity), priorItem);
-      } catch (financialError) {
-        if (financialError instanceof HttpError) throw financialError;
-        return res.status(400).json({ error: financialError.message });
-      }
-      const normalizedPricing = {
-        ...pricing,
-        price: financials.unitSellingPrice,
-        ...(pricing.priceUSD !== undefined
-          ? { priceUSD: financials.unitSellingPrice }
-          : {}),
-      };
-      const lineTotal = financials.revenue;
-      subtotal += lineTotal;
-
-      enrichedItems.push({
-        productId: new mongoose.Types.ObjectId(productId),
-        name: name || product.name,
-        quantity: Number(quantity),
-        ...normalizedPricing,
-        total: lineTotal,
-        ...financials,
-      });
-    }
+    // Every line is re-validated against the corrected cart: a correction that
+    // brings the cart under 5 pieces while a line stays discounted is refused
+    // (DISCOUNT_QUANTITY_REQUIRED) before any stock or sale mutation.
+    const enrichedItems = await priceSaleItems(items, {
+      saleRate: transactionExchangeRate,
+      priorSale: originalSale,
+      user: req.user,
+    });
 
     const financialTotals = sumFinancialSnapshots(enrichedItems);
-    subtotal = financialTotals.totalRevenue;
+    const subtotal = financialTotals.totalRevenue;
     const total = subtotal;
     // Track what changed
     if (JSON.stringify(originalSale.customer) !== JSON.stringify(customerData)) {
@@ -1537,8 +1709,13 @@ router.put("/:id", authMiddleware, async (req, res) => {
       return savedSale;
     });
 
-    res.json(safeSaleResponse(updatedSale));
+    res.json(safeSaleResponse(updatedSale, req.user));
   } catch (error) {
+    if (error instanceof DiscountValidationError) {
+      console.warn("Sale correction discount rejected", { user: req.user?.username, code: error.code, itemIndex: error.itemIndex });
+      recordDiscountRejection(req.user, error);
+      return sendDiscountError(res, error);
+    }
     console.error("Error editing sale:", error);
     if (error.name === "CastError") {
       return res.status(400).json({ error: "Invalid sale ID" });
@@ -1582,7 +1759,7 @@ router.patch("/:id/complete", authMiddleware, async (req, res) => {
     if (!updatedSale) {
       return res.status(409).json({ error: "Reservation status changed; refresh and retry" });
     }
-    res.json(updatedSale);
+    res.json(safeSaleResponse(updatedSale, req.user));
   } catch (error) {
     console.error("Error completing reservation:", error);
     res.status(500).json({ error: "Échec de la mise à jour de la réservation" });
@@ -1630,7 +1807,7 @@ router.patch("/:id/pending", authMiddleware, async (req, res) => {
       if (!updated) throw new HttpError(409, "Only a completed reservation can return to pending");
       return updated;
     });
-    res.json(updatedSale);
+    res.json(safeSaleResponse(updatedSale, req.user));
   } catch (error) {
     console.error("Error setting reservation to pending:", error);
     return sendMutationError(res, error, "Échec de la mise à jour de la réservation");
@@ -1701,7 +1878,7 @@ router.patch("/:id/void", authMiddleware, async (req, res) => {
     return updatedSale;
     });
 
-    res.json(safeSaleResponse(voidedSale));
+    res.json(safeSaleResponse(voidedSale, req.user));
   } catch (error) {
     console.error("Error voiding sale:", error);
     return sendMutationError(res, error, "Failed to void sale");

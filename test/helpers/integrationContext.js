@@ -10,6 +10,7 @@ const ExchangeRate = require("../../models/ExchangeRate");
 const User = require("../../models/User");
 const AccountingLock = require("../../models/AccountingLock");
 const { aggregateCategoryAccounting, ensureAccountingLocks } = require("../../services/financialAccountingService");
+const { discountProbeGuard } = require("../../utils/discountProbeGuard");
 
 const SKIP = process.env.SKIP_DB_TESTS
   ? "SKIP_DB_TESTS is set"
@@ -44,6 +45,7 @@ function createIntegrationContext() {
   ctx.reset = async () => {
     if (SKIP) return;
     await Promise.all([Sale, Expense, Product, Customer, Entry, ExchangeRate].map((model) => model.deleteMany({})));
+    discountProbeGuard.reset();
   };
 
   ctx.request = (...args) => ctx.app.request(...args);
@@ -57,13 +59,23 @@ function createIntegrationContext() {
     });
   };
 
-  ctx.sell = async (items, { role = "staff", type = "sale", paymentMethod = "cash", exchangeRate, customer } = {}) => {
+  // The server only accepts the rate that is active in the database (the POS
+  // reads it from /exchange-rates/current), so a test rate is activated first.
+  ctx.setRate = async (rate) => {
+    const current = await ExchangeRate.getCurrentRate();
+    if (current?.rate === rate) return current;
+    await ExchangeRate.updateMany({ isActive: true }, { $set: { isActive: false } });
+    return ExchangeRate.create({ rate, createdBy: ctx.users.superadmin.user._id, isActive: true, effectiveFrom: new Date() });
+  };
+
+  ctx.sell = async (items, { role = "staff", type = "sale", paymentMethod = "cash", exchangeRate, customer, requestKey } = {}) => {
+    if (exchangeRate !== undefined) await ctx.setRate(exchangeRate);
     const body = {
       items: items.map(({ product, quantity = 1, price, enteredPrice, enteredCurrency }) => ({
         productId: String(product._id), quantity, price: price ?? product.price,
         ...(enteredCurrency ? { enteredPrice, enteredCurrency } : {}),
       })),
-      paymentMethod, type, exchangeRate,
+      paymentMethod, type, exchangeRate, requestKey,
       ...(type === "reservation" || customer ? { customer: customer || { name: "Client", phone: `09${Math.floor(Math.random() * 1e8)}` } } : { isWalkIn: true }),
     };
     return ctx.request("POST", "/sales", { token: ctx.token(role), body });

@@ -21,6 +21,7 @@ function createApp() {
     ...(categorySensitive ? [requireAssignedCategory] : []),
     blockShareholderMutations,
   ];
+  app.use("/api/products", ...guarded([MODULES.PRODUCTS], true), require("../../routes/products"));
   app.use("/api/sales", ...guarded([MODULES.SALES_HISTORY], true), require("../../routes/sales"));
   app.use("/api/expenses", ...guarded([MODULES.EXPENSES]), require("../../routes/expenses"));
   app.use("/api/entries", ...guarded([MODULES.ENTRIES]), require("../../routes/entries"));

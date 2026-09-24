@@ -22,6 +22,8 @@ const {
   CATEGORIES,
   buildCategoryReport,
 } = require("../services/financialAccountingService");
+const { getFallbackExchangeRate } = require("../utils/currentExchangeRate");
+const { productNormalPriceUSDExpression } = require("../utils/salePricing");
 
 const router = express.Router();
 router.use(authMiddleware);
@@ -109,7 +111,7 @@ async function aggregatePeriod(createdAt, category = null, { withAccounting = tr
               $group: {
                 _id: { productId: "$items.productId", name: "$items.name" },
                 quantity: { $sum: "$items.quantity" },
-                revenue: { $sum: { $multiply: [{ $ifNull: ["$items.priceUSD", "$items.price"] }, "$items.quantity"] } },
+                revenue: { $sum: { $ifNull: ["$items.revenue", { $multiply: [{ $ifNull: ["$items.priceUSD", "$items.price"] }, "$items.quantity"] }] } },
               },
             },
             { $sort: { quantity: -1, revenue: -1 } },
@@ -250,6 +252,7 @@ router.get("/summary", async (req, res) => {
     if (chart.unit === "week") dateTrunc.startOfWeek = "monday";
 
     const visibleCategories = category ? [category] : CATEGORIES;
+    const currentRate = await getFallbackExchangeRate();
     const [current, previous, chartRows, debt, inventoryRows] = await Promise.all([
       aggregatePeriod(currentRange, category),
       aggregatePeriod(priorRange, category, { withAccounting: false }),
@@ -280,7 +283,7 @@ router.get("/summary", async (req, res) => {
           products: { $sum: 1 },
           unitsInStock: { $sum: "$stock" },
           acquisitionValue: { $sum: { $multiply: ["$stock", "$unitCost"] } },
-          retailValue: { $sum: { $multiply: ["$stock", "$price"] } },
+          retailValue: { $sum: { $multiply: ["$stock", productNormalPriceUSDExpression(currentRate)] } },
         } },
       ]),
     ]);

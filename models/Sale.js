@@ -54,6 +54,13 @@ const saleItemSchema = new mongoose.Schema({
   unitAcquisitionCost: { type: Number, required: false, min: 0 },
   unitSellingPriceFC: { type: Number, required: false },
   unitAcquisitionCostFC: { type: Number, required: false, min: 0 },
+  // Immutable normal-price snapshot used to authorize and explain a discount.
+  // The protected floor is deliberately never persisted or returned.
+  referenceUnitSellingPrice: { type: Number, required: false, min: 0 },
+  referenceUnitSellingPriceFC: { type: Number, required: false, min: 0 },
+  discountApplied: { type: Boolean, required: false, default: false },
+  discountPerUnit: { type: Number, required: false, min: 0 },
+  discountPerUnitFC: { type: Number, required: false, min: 0 },
   revenue: { type: Number, required: false },
   revenueFC: { type: Number, required: false },
   costOfGoodsSold: { type: Number, required: false },
@@ -233,6 +240,9 @@ const saleSchema = new mongoose.Schema({
     type: Date,
     default: null
   },
+  // Client-generated idempotency key: a retried submission replays the sale
+  // already recorded instead of creating a duplicate (same pattern as Expense).
+  requestKey: { type: String, trim: true, maxlength: 100, default: undefined },
   editHistory: [{
     editedBy: {
       type: String,
@@ -264,6 +274,10 @@ saleSchema.index({ customerId: 1, createdAt: -1 });
 // period reports recognize reservations on their completion date.
 saleSchema.index({ "items.mainCategory": 1, status: 1, type: 1, createdAt: -1 });
 saleSchema.index({ type: 1, status: 1, completedAt: -1 });
+saleSchema.index(
+  { requestKey: 1 },
+  { name: "requestKey_unique_when_set", unique: true, partialFilterExpression: { requestKey: { $type: "string" } } }
+);
 
 // Pre-save middleware to calculate item totals (only for sales with items)
 saleSchema.pre("save", function(next) {
