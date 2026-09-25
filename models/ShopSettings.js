@@ -9,7 +9,7 @@ const shopSettingsSchema = new mongoose.Schema(
     },
     shopNumber: {
       type: String,
-      default: "+243 836 017 031",
+      default: "+243 975 085 799",
     },
     shopRegistration: { type: String, default: "LSH/RCCM/22-A-01266" },
     receiptFooter: {

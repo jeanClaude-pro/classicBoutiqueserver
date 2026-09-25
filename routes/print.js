@@ -3,39 +3,26 @@ const escpos = require('escpos');
 escpos.USB = require('escpos-usb');
 const router = express.Router();
 const authMiddleware = require('../middleware/auth');
+const {
+  amountRow,
+  itemTableRows,
+  lineWidth,
+  receiptLabels,
+  receiptLines,
+  receiptTotalFC,
+} = require('../utils/receiptLayout');
 
 router.use(authMiddleware);
 
-function fcUnitPrice(item, saleRate) {
-  if (item.enteredCurrency === 'FC' && Number.isFinite(Number(item.enteredPrice))) return Number(item.enteredPrice);
-  if (Number.isFinite(Number(item.priceFC))) return Number(item.priceFC);
-  const rate = Number(item.exchangeRate ?? saleRate);
-  const usd = Number(item.unitSellingPrice ?? item.priceUSD ?? item.unitPrice ?? item.price);
-  return Number.isFinite(rate) && rate > 0 && Number.isFinite(usd) ? Math.round(usd * rate) : undefined;
-}
-
-function formatFc(value) {
-  return `${Math.round(value).toLocaleString('fr-FR').replace(/\s/g, ' ')}FC`;
-}
-
-function dualItemAmount(item, quantity, saleRate) {
-  const usd = Number(item.unitSellingPrice ?? item.priceUSD ?? item.unitPrice ?? item.price) * quantity;
-  const fcUnit = fcUnitPrice(item, saleRate);
-  return `${usd.toFixed(2)}$${fcUnit === undefined ? '' : ` / ${formatFc(fcUnit * quantity)}`}`;
-}
-
-function dualSaleTotal(receiptData) {
-  const items = Array.isArray(receiptData.items) ? receiptData.items : [];
-  const fcTotals = items.map((item) => {
-    const unit = fcUnitPrice(item, receiptData.exchangeRate);
-    return unit === undefined ? undefined : unit * Number(item.quantity);
-  });
-  const fc = fcTotals.length && fcTotals.every((value) => value !== undefined)
-    ? fcTotals.reduce((sum, value) => sum + value, 0)
-    : Number.isFinite(Number(receiptData.exchangeRate))
-      ? Math.round(Number(receiptData.total) * Number(receiptData.exchangeRate))
-      : undefined;
-  return `${Number(receiptData.total).toFixed(2)}$${fc === undefined ? '' : ` / ${formatFc(fc)}`}`;
+// Customer-facing money on the thermal receipt and stub is FC only; see
+// utils/receiptLayout.js for the historical FC value of each line.
+function receiptContent(receiptData) {
+  const width = lineWidth();
+  const labels = receiptLabels(receiptData.labels);
+  const lines = receiptLines(receiptData.items, receiptData.exchangeRate);
+  const totalFC = receiptTotalFC(lines);
+  const payment = String(receiptData.paymentLabel || receiptData.paymentMethod || "").toUpperCase();
+  return { width, labels, lines, totalFC, payment };
 }
 
 // Find and use the first available USB printer
@@ -69,78 +56,62 @@ router.post('/receipt', async (req, res) => {
       }
 
       try {
+        const { width, labels, lines, totalFC, payment } = receiptContent(receiptData);
+
         // Print receipt header
         printer
           .font('a')
           .align('ct')
           .style('b')
           .size(2, 2)
-          .text('ETS DOUBLE M CLASSIC BOUTIQUE')
+          .text(receiptData.shopName || 'ETS DOUBLE M CLASSIC BOUTIQUE')
           .size(1, 1)
-          .text('_Vêtements & Chaussures_')
+          .text(labels.tagline)
           .align('lt')
           .text(receiptData.shopAddress)
           .text(receiptData.shopRegistration)
           .text(receiptData.shopNumber)
-          .text(`Date: ${receiptData.date}`)
-          .text(`Reçu #: ${receiptData.receiptNumber}`)
+          .text(`${labels.date}: ${receiptData.date}`)
+          .text(`${labels.receiptNo}: ${receiptData.receiptNumber}`)
           .feed(1);
 
         // Customer information
         printer
-          .style('b')
-          .text('CLIENT')
           .style('normal')
-          .text(`Nom: ${receiptData.customerName}`);
+          .text(`${labels.customer}: ${receiptData.customerName}`);
 
         if (receiptData.customerPhone) {
-          printer.text(`Tél: ${receiptData.customerPhone}`);
+          printer.text(`${labels.phone}: ${receiptData.customerPhone}`);
         }
 
         if (receiptData.customerEmail) {
-          printer.text(`Email: ${receiptData.customerEmail}`);
+          printer.text(`${labels.email}: ${receiptData.customerEmail}`);
         }
 
         printer.feed(1);
 
-        // Items
+        // Items: ARTICLE | PU | QTE | TOTAL, FC only
+        for (const row of itemTableRows(lines, labels, width)) printer.text(row);
+
+        // Totals
         printer
           .style('b')
-          .text('ARTICLES')
-          .style('normal');
-
-        receiptData.items.forEach((item) => {
-          const quantity = Number(item.quantity);
-          const name = String(item.name || '').slice(0, 32);
-          printer
-            .text(`${quantity}x ${name}`)
-            .align('rt')
-            .text(dualItemAmount(item, quantity, receiptData.exchangeRate))
-            .align('lt');
-        });
-
-        // Total
-        printer
-          .feed(1)
-          .style('b')
-          .text('TOTAL:')
-          .align('rt')
-          .text(dualSaleTotal(receiptData))
-          .align('lt')
-          .text(`Paiement: ${receiptData.paymentMethod.toUpperCase()}`)
+          .text(amountRow(labels.subtotal, totalFC, width))
+          .text(amountRow(labels.total, totalFC, width))
+          .text(`${labels.payment}: ${payment}`)
           .feed(1);
 
         // Sales person
         printer
           .style('normal')
-          .text(`Agent: ${receiptData.salesPerson}`)
+          .text(`${labels.agent}: ${receiptData.salesPerson}`)
           .feed(1);
 
         // Footer
         printer
           .align('ct')
-          .text('✅ Merci pour votre achat !')
-          .text('Non échangeable - Non remboursable')
+          .text(receiptData.receiptFooter || labels.thanks)
+          .text(labels.noExchange)
           .feed(2);
 
         if (type === 'reservation') {
@@ -189,57 +160,48 @@ router.post('/stub', async (req, res) => {
       }
 
       try {
+        const { width, labels, lines, totalFC, payment } = receiptContent(receiptData);
+
         // Print stub header
         printer
           .font('a')
           .align('ct')
           .style('b')
           .size(1, 1)
-          .text('SOUCHE')
-          .text('ETS DOUBLE M CLASSIC BOUTIQUE')
-          .text('_Vêtements & Chaussures_')
+          .text(labels.stubTitle)
+          .text(receiptData.shopName || 'ETS DOUBLE M CLASSIC BOUTIQUE')
+          .text(labels.tagline)
           .align('lt')
-          .text(`Date: ${receiptData.date}`)
-          .text(`Reçu #: ${receiptData.receiptNumber}`)
+          .text(`${labels.date}: ${receiptData.date}`)
+          .text(`${labels.receiptNo}: ${receiptData.receiptNumber}`)
           .feed(1);
 
         // Customer information
-        printer.text(`Client: ${receiptData.customerName}`);
+        printer.style('normal').text(`${labels.customer}: ${receiptData.customerName}`);
         if (receiptData.customerPhone) {
-          printer.text(`Tél: ${receiptData.customerPhone}`);
+          printer.text(`${labels.phone}: ${receiptData.customerPhone}`);
         }
         printer.feed(1);
 
-        // Items summary
-        printer
-          .style('b')
-          .text('ARTICLES:')
-          .style('normal');
-
-        receiptData.items.forEach((item) => {
-          const quantity = Number(item.quantity);
-          printer
-            .text(`${quantity}x ${String(item.name || '').slice(0, 32)}`)
-            .text(dualItemAmount(item, quantity, receiptData.exchangeRate));
-        });
+        // Items: ARTICLE | PU | QTE | TOTAL, FC only
+        for (const row of itemTableRows(lines, labels, width)) printer.text(row);
 
         // Total
         printer
-          .feed(1)
           .style('b')
-          .text(`Total: ${dualSaleTotal(receiptData)}`)
-          .text(`Paiement: ${receiptData.paymentMethod.toUpperCase()}`)
+          .text(amountRow(labels.saleTotal, totalFC, width))
+          .text(`${labels.payment}: ${payment}`)
           .feed(1);
 
         // Sales person
-        printer.text(`Agent: ${receiptData.salesPerson}`);
+        printer.text(`${labels.agent}: ${receiptData.salesPerson}`);
 
         // Stub footer
         printer
           .feed(1)
           .align('ct')
           .style('b')
-          .text(`SOUCHE N°${receiptData.stubNumber} DU JOUR`)
+          .text(labels.stubNumber.replace('{{number}}', String(receiptData.stubNumber)))
           .feed(1);
 
         if (type === 'reservation') {
