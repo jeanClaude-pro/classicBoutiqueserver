@@ -30,6 +30,17 @@ test("Analytics backend aggregates every financial collection and declares no pa
   assert.doesNotMatch(serverAnalytics, /parsePagination|\$skip|\$limit: limit/);
 });
 
+test("Items Sold returns every product aggregated in the selected period", () => {
+  const productsFacet = serverAnalytics.match(
+    /products:\s*\[([\s\S]*?)\],\s*productCount:/
+  )?.[1];
+
+  assert.ok(productsFacet, "products aggregation facet is present");
+  assert.match(productsFacet, /\$unwind:\s*"\$items"/);
+  assert.match(productsFacet, /quantity:\s*\{\s*\$sum:\s*"\$items\.quantity"/);
+  assert.doesNotMatch(productsFacet, /\$limit/);
+});
+
 const accountingService = fs.readFileSync(
   path.join(__dirname, "../services/financialAccountingService.js"),
   "utf8"

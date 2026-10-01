@@ -243,6 +243,13 @@ const saleSchema = new mongoose.Schema({
   // Client-generated idempotency key: a retried submission replays the sale
   // already recorded instead of creating a duplicate (same pattern as Expense).
   requestKey: { type: String, trim: true, maxlength: 100, default: undefined },
+  // Durable POS identity. It is generated before the first network attempt and
+  // remains the customer-visible reference after synchronization.
+  clientSaleId: { type: String, trim: true, maxlength: 100, default: undefined },
+  receiptNumber: { type: String, trim: true, maxlength: 120, default: undefined },
+  requestFingerprint: { type: String, select: false, default: undefined },
+  occurredAt: { type: Date, default: undefined, index: true },
+  createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: undefined, index: true },
   editHistory: [{
     editedBy: {
       type: String,
@@ -277,6 +284,10 @@ saleSchema.index({ type: 1, status: 1, completedAt: -1 });
 saleSchema.index(
   { requestKey: 1 },
   { name: "requestKey_unique_when_set", unique: true, partialFilterExpression: { requestKey: { $type: "string" } } }
+);
+saleSchema.index(
+  { clientSaleId: 1 },
+  { name: "clientSaleId_unique_when_set", unique: true, partialFilterExpression: { clientSaleId: { $type: "string" } } }
 );
 
 // Pre-save middleware to calculate item totals (only for sales with items)

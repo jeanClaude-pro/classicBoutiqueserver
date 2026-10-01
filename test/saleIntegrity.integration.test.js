@@ -5,6 +5,7 @@ const { SKIP, createIntegrationContext } = require("./helpers/integrationContext
 const Product = require("../models/Product");
 const Sale = require("../models/Sale");
 const Customer = require("../models/Customer");
+const ExchangeRate = require("../models/ExchangeRate");
 
 const ctx = createIntegrationContext();
 test.before(ctx.setup);
@@ -208,6 +209,28 @@ itest("a retried submission with the same request key records exactly one sale",
   assert.deepEqual(concurrent.map((response) => response.status).sort(), [200, 200, 201]);
   assert.equal(await Sale.countDocuments(), 2);
   assert.equal((await Product.findById(product._id)).stock, 17);
+});
+
+itest("an offline sale keeps its authoritative historical rate and retry identity", async () => {
+  const product = await fcPricedProduct("CLOTHES", 10);
+  const oldRate = await ctx.setRate(2850);
+  const occurredAt = new Date(Date.now() - 60 * 60 * 1000);
+  await ExchangeRate.findByIdAndUpdate(oldRate._id, { effectiveFrom: new Date(Date.now() - 2 * 60 * 60 * 1000) });
+  await ctx.setRate(2900);
+  const body = {
+    isWalkIn: true, paymentMethod: "cash", offline: true, occurredAt: occurredAt.toISOString(),
+    exchangeRate: oldRate.rate, requestKey: "offline-sale-key", clientSaleId: "offline-sale-key", receiptNumber: "POS-offline-sale-key",
+    items: [{ productId: String(product._id), quantity: 2, price: 20000 / oldRate.rate, enteredPrice: 20000, enteredCurrency: "FC", exchangeRate: oldRate.rate }],
+  };
+  const first = await ctx.request("POST", "/sales", { token: ctx.token("staff"), body });
+  const retry = await ctx.request("POST", "/sales", { token: ctx.token("staff"), body });
+  assert.equal(first.status, 201, JSON.stringify(first.body));
+  assert.equal(retry.status, 200, JSON.stringify(retry.body));
+  assert.equal(retry.body._id, first.body._id);
+  assert.equal(first.body.exchangeRate, oldRate.rate);
+  assert.equal(first.body.receiptNumber, "POS-offline-sale-key");
+  assert.equal(await Sale.countDocuments({ requestKey: "offline-sale-key" }), 1);
+  assert.equal((await Product.findById(product._id)).stock, 8);
 });
 
 itest("20, 25. legacy sales without discount or FC-revenue fields stay stable and correctable", async () => {

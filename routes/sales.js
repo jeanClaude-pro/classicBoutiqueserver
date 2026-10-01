@@ -2,9 +2,11 @@
 const express = require("express");
 const router = express.Router();
 const mongoose = require("mongoose");
+const crypto = require("node:crypto");
 const Sale = require("../models/Sale");
 const Customer = require("../models/Customer");
 const Product = require("../models/Product");
+const ExchangeRate = require("../models/ExchangeRate");
 const authMiddleware = require("../middleware/auth");
 const {
   normalizeExchangeRate,
@@ -49,6 +51,7 @@ const PROTECTED_SALE_FIELDS = [
 const canViewProtectedFinancials = (user) => ["admin", "superadmin"].includes(user?.role);
 function safeSaleResponse(sale, user) {
   const value = typeof sale.toObject === "function" ? sale.toObject() : { ...sale };
+  delete value.requestFingerprint;
   if (canViewProtectedFinancials(user)) return value;
   for (const field of PROTECTED_SALE_FIELDS) delete value[field];
   value.items = (value.items || []).map((item) => {
@@ -272,7 +275,19 @@ class ExchangeRateMismatchError extends HttpError {
 // priced its cart at another rate (stale page, or a forged request trying to
 // shrink the USD value of an FC price) is refused instead of being trusted.
 async function resolveNewSaleExchangeRate(body) {
-  const activeRate = normalizeExchangeRate(await getFallbackExchangeRate());
+  let activeRate;
+  if (body.offline === true && body.occurredAt) {
+    const occurredAt = new Date(body.occurredAt);
+    const age = Date.now() - occurredAt.getTime();
+    if (!Number.isFinite(occurredAt.getTime()) || age < -5 * 60 * 1000 || age > 7 * 24 * 60 * 60 * 1000) {
+      throw new HttpError(409, "La date de la vente hors ligne est invalide ou trop ancienne.");
+    }
+    const historical = await ExchangeRate.findOne({ effectiveFrom: { $lte: occurredAt } }).sort({ effectiveFrom: -1 }).lean();
+    if (!historical) throw new HttpError(409, "Aucun taux historique ne correspond à cette vente hors ligne.");
+    activeRate = normalizeExchangeRate(historical.rate);
+  } else {
+    activeRate = normalizeExchangeRate(await getFallbackExchangeRate());
+  }
   const claimedRates = [body.exchangeRate, ...(Array.isArray(body.items) ? body.items.map((item) => item?.exchangeRate) : [])]
     .filter((rate) => rate !== undefined && rate !== null && rate !== "");
   for (const claimed of claimedRates) {
@@ -288,14 +303,26 @@ function sendDiscountError(res, error) {
 
 // Items identify a sale request for idempotent replay: the same key with a
 // different cart is a conflict, never a silent second sale.
-const saleRequestFingerprint = (items = []) => JSON.stringify(
+const legacySaleRequestFingerprint = (items = []) => JSON.stringify(
   (Array.isArray(items) ? items : []).map((item) => [String(item?.productId), Number(item?.quantity)]).sort()
 );
+const saleRequestFingerprint = (body = {}) => crypto.createHash("sha256").update(JSON.stringify({
+  customer: body.isWalkIn ? null : { name: String(body.customer?.name || "").trim(), phone: String(body.customer?.phone || "").trim() },
+  isWalkIn: Boolean(body.isWalkIn), paymentMethod: normalizePaymentMethod(body.paymentMethod),
+  exchangeRate: Number(body.exchangeRate), occurredAt: body.occurredAt || null,
+  items: (Array.isArray(body.items) ? body.items : []).map((item) => ({
+    productId: String(item?.productId), quantity: Number(item?.quantity), price: Number(item?.price),
+    enteredPrice: Number(item?.enteredPrice), enteredCurrency: item?.enteredCurrency,
+  })),
+})).digest("hex");
 const saleRequestKey = (body) => typeof body?.requestKey === "string"
   ? body.requestKey.trim().slice(0, 100) || undefined
   : undefined;
 function replaySaleRequest(res, req, existing) {
-  if (saleRequestFingerprint(existing.items) !== saleRequestFingerprint(req.body.items)) {
+  const fingerprintMatches = existing.requestFingerprint
+    ? existing.requestFingerprint === saleRequestFingerprint(req.body)
+    : legacySaleRequestFingerprint(existing.items) === legacySaleRequestFingerprint(req.body.items);
+  if (!fingerprintMatches || (existing.createdBy && String(existing.createdBy) !== String(req.user._id))) {
     return res.status(409).json({ error: "IDEMPOTENCY_CONFLICT", message: "Cette clé de requête a déjà été utilisée avec des données différentes." });
   }
   return res.status(200).json(safeSaleResponse(existing, req.user));
@@ -1073,7 +1100,7 @@ router.post("/", authMiddleware, async (req, res) => {
     // A retry of a sale that was already recorded (lost response, double
     // submission) replays that sale before anything is re-validated.
     if (requestKey) {
-      const existing = await Sale.findOne({ requestKey }).lean();
+      const existing = await Sale.findOne({ requestKey }).select("+requestFingerprint").lean();
       if (existing) return replaySaleRequest(res, req, existing);
     }
 
@@ -1137,13 +1164,18 @@ router.post("/", authMiddleware, async (req, res) => {
       reservationTime: reservationTime || null,
       notes: notes || "",
       requestKey,
+      clientSaleId: requestKey || undefined,
+      receiptNumber: typeof req.body.receiptNumber === "string" ? req.body.receiptNumber.trim().slice(0, 120) : undefined,
+      requestFingerprint: requestKey ? saleRequestFingerprint(req.body) : undefined,
+      occurredAt: req.body.occurredAt ? new Date(req.body.occurredAt) : undefined,
+      createdBy: req.user._id,
     };
 
     const savedSale = await runTransaction(async (session) => {
       // Re-checked inside the transaction: a concurrent identical submission
       // that committed first is replayed instead of creating a second sale.
       if (requestKey) {
-        const existing = await Sale.findOne({ requestKey }).session(session).lean();
+        const existing = await Sale.findOne({ requestKey }).select("+requestFingerprint").session(session).lean();
         if (existing) return { replayed: existing };
       }
       // Walk-in sales never create or update a Customer record.
@@ -1173,9 +1205,9 @@ router.post("/", authMiddleware, async (req, res) => {
     return res.status(201).json(safeSaleResponse(savedSale, req.user));
   } catch (error) {
     const requestKey = saleRequestKey(req.body);
-    if (error?.code === 11000 && requestKey && /requestKey/.test(error.message || "")) {
+    if (error?.code === 11000 && requestKey && /(requestKey|clientSaleId)/.test(error.message || "")) {
       // A concurrent identical submission committed first: replay it.
-      const existing = await Sale.findOne({ requestKey }).lean();
+      const existing = await Sale.findOne({ requestKey }).select("+requestFingerprint").lean();
       if (existing) return replaySaleRequest(res, req, existing);
     }
     if (error instanceof DiscountValidationError) {

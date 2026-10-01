@@ -115,7 +115,6 @@ async function aggregatePeriod(createdAt, category = null, { withAccounting = tr
               },
             },
             { $sort: { quantity: -1, revenue: -1 } },
-            { $limit: 10 },
           ],
           productCount: [
             { $unwind: "$items" },

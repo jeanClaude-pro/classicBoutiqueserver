@@ -106,6 +106,11 @@ const guarded = (modules, categorySensitive = false) => [
 ];
 
 // ====== Use Routes ======
+app.get("/api/health", (_req, res) => {
+  res.set("Cache-Control", "no-store");
+  const connected = mongoose.connection.readyState === 1;
+  res.status(connected ? 200 : 503).json({ ok: connected, database: connected ? "connected" : "unavailable" });
+});
 app.use("/api/products", ...guarded([MODULES.PRODUCTS], true), require("./routes/products"));
 app.use("/api/sales", ...guarded([MODULES.SALES_HISTORY], true), require("./routes/sales"));
 app.use("/api/customers", ...guarded([MODULES.CUSTOMERS]), require("./routes/customers"));
