@@ -149,7 +149,12 @@ function recognizedSaleMatch(category, range) {
   return match;
 }
 
-function saleTotalsPipeline(category, range) {
+// Per-line amounts of an unwound sale item, read from its immutable
+// snapshots: revenue is the actual selling amount (quantity x actual unit
+// price, discounts included) and COGS the purchase-cost snapshot taken at the
+// sale. Shared by category accounting and the products-sold report so both
+// always use the same definition.
+function saleLineAmountExpressions() {
   const itemRate = { $ifNull: ["$items.exchangeRate", { $ifNull: ["$exchangeRate", 0] }] };
   const revenueUSD = { $ifNull: ["$items.revenue", { $multiply: [{ $ifNull: ["$items.priceUSD", "$items.price"] }, "$items.quantity"] }] };
   const cogsUSD = { $ifNull: ["$items.costOfGoodsSold", 0] };
@@ -157,17 +162,27 @@ function saleTotalsPipeline(category, range) {
   // converting the cent-rounded USD revenue (20,000 FC must not become 20,007).
   const unitPriceFC = { $cond: [{ $eq: ["$items.enteredCurrency", "FC"] }, "$items.enteredPrice", "$items.priceFC"] };
   const legacyRevenueFC = { $ifNull: [{ $multiply: [unitPriceFC, "$items.quantity"] }, { $multiply: [revenueUSD, itemRate] }] };
+  return {
+    revenueCents: centsExpr(revenueUSD),
+    cogsCents: centsExpr(cogsUSD),
+    revenueFC: { $ifNull: ["$items.revenueFC", legacyRevenueFC] },
+    cogsFC: { $ifNull: ["$items.costOfGoodsSoldFC", { $multiply: [cogsUSD, itemRate] }] },
+  };
+}
+
+function saleTotalsPipeline(category, range) {
+  const line = saleLineAmountExpressions();
   return [
     { $match: recognizedSaleMatch(category, range) },
     { $unwind: "$items" },
     { $match: { "items.mainCategory": category } },
     { $project: {
-      revenueCents: centsExpr(revenueUSD),
-      cogsCents: centsExpr(cogsUSD),
+      revenueCents: line.revenueCents,
+      cogsCents: line.cogsCents,
       storedGrossCents: centsExpr("$items.grossProfit"),
       quantity: "$items.quantity",
-      revenueFC: { $ifNull: ["$items.revenueFC", legacyRevenueFC] },
-      cogsFC: { $ifNull: ["$items.costOfGoodsSoldFC", { $multiply: [cogsUSD, itemRate] }] },
+      revenueFC: line.revenueFC,
+      cogsFC: line.cogsFC,
     } },
     { $group: {
       _id: null,
@@ -391,4 +406,5 @@ module.exports = {
   aggregateCategoryAccounting, buildCategoryReport, acquireAccountingLock,
   acquireAccountingLocksForItems, purchaseSnapshot, projectAccounting, ensureAccountingLocks,
   saleTotalsPipeline, expenseTotalsPipeline, splitShoesProfit,
+  recognizedSaleMatch, saleLineAmountExpressions,
 };

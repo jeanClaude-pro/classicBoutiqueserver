@@ -9,6 +9,7 @@ const Entry = require("../../models/Entry");
 const ExchangeRate = require("../../models/ExchangeRate");
 const User = require("../../models/User");
 const AccountingLock = require("../../models/AccountingLock");
+const StockMovement = require("../../models/StockMovement");
 const { aggregateCategoryAccounting, ensureAccountingLocks } = require("../../services/financialAccountingService");
 const { discountProbeGuard } = require("../../utils/discountProbeGuard");
 
@@ -25,7 +26,7 @@ function createIntegrationContext() {
     if (SKIP) return;
     replicaSet = await startReplicaSet();
     await mongoose.connect(replicaSet.uri);
-    await Promise.all([Sale, Expense, Product, Customer, Entry, ExchangeRate, User, AccountingLock].map((model) => model.init()));
+    await Promise.all([Sale, Expense, Product, Customer, Entry, ExchangeRate, User, AccountingLock, StockMovement].map((model) => model.init()));
     await ensureAccountingLocks();
     ctx.app = await startApp();
     for (const role of ["superadmin", "manager", "inventory_manager", "cashier_supervisor", "staff"]) {
@@ -44,7 +45,7 @@ function createIntegrationContext() {
 
   ctx.reset = async () => {
     if (SKIP) return;
-    await Promise.all([Sale, Expense, Product, Customer, Entry, ExchangeRate].map((model) => model.deleteMany({})));
+    await Promise.all([Sale, Expense, Product, Customer, Entry, ExchangeRate, StockMovement].map((model) => model.deleteMany({})));
     discountProbeGuard.reset();
   };
 

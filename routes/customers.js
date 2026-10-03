@@ -17,6 +17,7 @@ router.get("/", async (req, res) => {
     
     // Build filter object
     const filter = {};
+    if (req.query.familyOnly === "true") filter.isFamilyMember = true;
     
     if (search) {
       const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -43,6 +44,32 @@ router.get("/", async (req, res) => {
   } catch (error) {
     console.error("Error fetching customers:", error);
     res.status(500).json({ error: "Failed to fetch customers" });
+  }
+});
+
+// POST /api/customers - Create a client record without inventing a sale.
+// Family classification is an operational-administrator action.
+router.post("/", async (req, res) => {
+  try {
+    if (req.user.role !== "superadmin") return res.status(403).json({ error: "Superadministrator access required" });
+    const name = String(req.body?.name || "").trim();
+    const phone = String(req.body?.phone || "").trim() || undefined;
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    if (!name || name.length > 120) return res.status(400).json({ error: "Invalid name" });
+    if (email && (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254)) {
+      return res.status(400).json({ error: "Invalid email" });
+    }
+    if (phone && await Customer.exists({ phone })) return res.status(409).json({ error: "A customer with this phone already exists" });
+    const isFamilyMember = req.body?.isFamilyMember === true;
+    const customer = await Customer.create({
+      name, phone, email, isFamilyMember,
+      ...(isFamilyMember ? { familyStatusUpdatedAt: new Date(), familyStatusUpdatedBy: req.user._id } : {}),
+    });
+    return res.status(201).json(customer);
+  } catch (error) {
+    if (error?.code === 11000) return res.status(409).json({ error: "A customer with this phone already exists" });
+    console.error("Error creating customer:", error);
+    return res.status(500).json({ error: "Failed to create customer" });
   }
 });
 
@@ -166,6 +193,13 @@ router.put("/:id", async (req, res) => {
       const cleanEmail = String(email).trim().toLowerCase();
       if (cleanEmail.length > 254 || (cleanEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail))) return res.status(400).json({ error: "Invalid email" });
       updateData.email = cleanEmail;
+    }
+    if (req.body.isFamilyMember !== undefined) {
+      if (req.user.role !== "superadmin") return res.status(403).json({ error: "Superadministrator access required" });
+      if (typeof req.body.isFamilyMember !== "boolean") return res.status(400).json({ error: "isFamilyMember must be a boolean" });
+      updateData.isFamilyMember = req.body.isFamilyMember;
+      updateData.familyStatusUpdatedAt = new Date();
+      updateData.familyStatusUpdatedBy = req.user._id;
     }
     
     const customer = await Customer.findByIdAndUpdate(

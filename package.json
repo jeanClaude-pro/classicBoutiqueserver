@@ -11,7 +11,8 @@
     "migrate:superadmin": "node scripts/migrateAdminsToSuperadmin.js",
     "migrate:expense-accounting": "node scripts/migrateExpenseAccounting.js",
     "seed:categories": "node scripts/seedCategories.js",
-    "migrate:shop-number": "node scripts/updateShopNumber.js"
+    "migrate:shop-number": "node scripts/updateShopNumber.js",
+    "migrate:stock-ledger": "node scripts/migrateStockLedger.js"
   },
   "keywords": [
     "erp"

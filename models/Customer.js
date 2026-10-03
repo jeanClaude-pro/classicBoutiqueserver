@@ -16,6 +16,13 @@ const customerSchema = new mongoose.Schema({
     trim: true,
     default: ""
   },
+  // Explicit opt-in classification. Legacy customers remain ordinary.
+  isFamilyMember: {
+    type: Boolean,
+    default: false
+  },
+  familyStatusUpdatedAt: { type: Date, default: undefined },
+  familyStatusUpdatedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: undefined },
   totalPurchases: {
     type: Number,
     default: 0
@@ -38,5 +45,7 @@ const customerSchema = new mongoose.Schema({
 customerSchema.index({ phone: 1 }, { unique: true, sparse: true });
 customerSchema.index({ name: "text" });
 customerSchema.index({ totalSpent: -1 });
+// Family-sale member search (familyOnly=true) in the POS.
+customerSchema.index({ isFamilyMember: 1, name: 1 });
 
 module.exports = mongoose.model("Customer", customerSchema);

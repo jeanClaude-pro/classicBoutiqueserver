@@ -7,8 +7,10 @@ const helmet = require("helmet");
 const { preventNoSqlInjection } = require("./middleware/security");
 const authMiddleware = require("./middleware/auth");
 const { ensureAccountingLocks } = require("./services/financialAccountingService");
+const { ensureStockBaselines } = require("./services/stockMovementService");
 const { repairReversalIndex } = require("./scripts/migrateExpenseAccounting");
 const { MODULES, blockShareholderMutations, requireAssignedCategory, requireShareholderModule } = require("./middleware/authorization");
+const { productStockSheet, stockSheet, salesSheet } = require("./routes/operationalReports");
 
 const app = express();
 const printRoutes = require('./routes/print');
@@ -111,6 +113,9 @@ app.get("/api/health", (_req, res) => {
   const connected = mongoose.connection.readyState === 1;
   res.status(connected ? 200 : 503).json({ ok: connected, database: connected ? "connected" : "unavailable" });
 });
+app.get("/api/products/stock-sheet", ...guarded([MODULES.PRODUCTS], true), stockSheet);
+app.get("/api/products/:id/stock-sheet", ...guarded([MODULES.PRODUCTS], true), productStockSheet);
+app.get("/api/analytics/sales-sheet", ...guarded([MODULES.REPORTS], true), salesSheet);
 app.use("/api/products", ...guarded([MODULES.PRODUCTS], true), require("./routes/products"));
 app.use("/api/sales", ...guarded([MODULES.SALES_HISTORY], true), require("./routes/sales"));
 app.use("/api/customers", ...guarded([MODULES.CUSTOMERS]), require("./routes/customers"));
@@ -141,6 +146,8 @@ mongoose
   .connect(MONGO_URI)
   .then(async () => {
     await ensureAccountingLocks();
+    const stockBaselines = await ensureStockBaselines();
+    if (stockBaselines) console.log(`Created ${stockBaselines} stock-ledger baseline(s)`);
     // Mongoose builds new indexes at boot but never drops obsolete ones; the
     // legacy unique+sparse reversalOf_1 rejects every expense after the first.
     try {

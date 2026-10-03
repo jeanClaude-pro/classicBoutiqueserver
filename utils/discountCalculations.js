@@ -46,6 +46,7 @@ function validateUnitSellingPrice({
   cartQuantity,
   actualUnitPriceFC,
   referenceUnitPriceFC,
+  skipQuantityRequirement = false,
 }) {
   const actualCents = toCents(actualUnitPrice, "actualUnitPrice");
   const referenceCents = toCents(referenceUnitPrice, "referenceUnitPrice");
@@ -55,7 +56,7 @@ function validateUnitSellingPrice({
     ? Number(actualUnitPriceFC) < Number(referenceUnitPriceFC)
     : actualCents < referenceCents;
 
-  if (discountApplied && cartQuantity < DISCOUNT_QUANTITY_THRESHOLD) {
+  if (discountApplied && !skipQuantityRequirement && cartQuantity < DISCOUNT_QUANTITY_THRESHOLD) {
     throw new DiscountValidationError(
       "DISCOUNT_QUANTITY_REQUIRED",
       "La remise exige au moins 5 pièces dans le panier."
@@ -68,7 +69,12 @@ function validateUnitSellingPrice({
     costCents + Math.ceil(originalProfitCents / 2)
   );
 
-  if (Number(actualUnitPrice) * 100 < minimumAllowedCents - FLOOR_EPSILON_CENTS) {
+  // The protected floor only limits DISCOUNTS. The normal selling price set
+  // on the Product is always accepted as is, even when it leaves little or
+  // no profit (profit = selling price - acquisition cost, possibly a loss),
+  // e.g. an FC price whose USD value fell under a USD-recorded cost after
+  // the exchange rate rose.
+  if (discountApplied && Number(actualUnitPrice) * 100 < minimumAllowedCents - FLOOR_EPSILON_CENTS) {
     throw new DiscountValidationError(
       "PRICE_TOO_LOW",
       "Prix trop bas. Veuillez augmenter le prix."

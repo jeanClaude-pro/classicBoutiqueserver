@@ -1,4 +1,5 @@
 const express = require("express");
+const mongoose = require("mongoose");
 const router = express.Router();
 const Product = require("../models/Product");
 const authMiddleware = require("../middleware/auth");
@@ -16,6 +17,7 @@ const {
   SUPPORTED_CURRENCIES,
 } = require("../utils/salePricing");
 const { getFallbackExchangeRate } = require("../utils/currentExchangeRate");
+const { recordProductEditMovements, recordStockMovement } = require("../services/stockMovementService");
 
 const canViewAcquisitionCosts = (user) => ["admin", "superadmin"].includes(user?.role);
 const acquisitionCostProjection = {
@@ -27,6 +29,15 @@ const acquisitionCostProjection = {
   totalAcquisitionCost: 0,
   totalAcquisitionCostFC: 0,
 };
+
+async function runTransaction(work) {
+  const session = await mongoose.startSession();
+  try {
+    let result;
+    await session.withTransaction(async () => { result = await work(session); });
+    return result;
+  } finally { await session.endSession(); }
+}
 
 // unitCost/price stay the canonical USD figures every profit calculation
 // reads from (semantics unchanged). This mirrors normalizeAmountSnapshot
@@ -246,7 +257,21 @@ router.post("/", authMiddleware, isAdmin, async (req, res) => {
       status: status || "active",
     });
 
-    const savedProduct = await product.save();
+    const savedProduct = await runTransaction(async (session) => {
+      await product.save({ session });
+      await recordStockMovement({
+        product,
+        quantityDelta: product.stock,
+        balanceBefore: 0,
+        balanceAfter: product.stock,
+        kind: "INITIAL",
+        sourceId: String(product._id),
+        occurredAt: product.createdAt,
+        createdBy: req.user._id,
+        session,
+      });
+      return product;
+    });
     res.status(201).json(savedProduct);
   } catch (error) {
     console.error("Error creating product:", error);
@@ -300,14 +325,23 @@ router.put("/:id", authMiddleware, isAdmin, async (req, res) => {
     if (weight !== undefined) updateData.weight = Number(weight);
     if (status !== undefined) updateData.status = status;
 
-    const updatedProduct = await Product.findByIdAndUpdate(
-      req.params.id,
-      updateData,
-      { new: true, runValidators: true }
-    );
+    // Sales change stock with $inc (no __v bump), so the stock value read
+    // above is part of the guard: an edit racing a sale is refused instead of
+    // silently overwriting the sale's deduction and desynchronising the ledger.
+    const updatedProduct = await runTransaction(async (session) => {
+      const updated = await Product.findOneAndUpdate(
+        { _id: req.params.id, __v: existingProduct.__v, stock: existingProduct.stock },
+        { $set: updateData, $inc: { __v: 1 } },
+        { new: true, runValidators: true, session }
+      );
+      if (updated) {
+        await recordProductEditMovements({ before: existingProduct, after: updated, createdBy: req.user._id, session });
+      }
+      return updated;
+    });
 
     if (!updatedProduct) {
-      return res.status(404).json({ error: "Product not found" });
+      return res.status(409).json({ error: "Product changed; refresh and retry" });
     }
 
     res.json(updatedProduct);
@@ -334,7 +368,24 @@ router.put("/:id", authMiddleware, isAdmin, async (req, res) => {
 // DELETE /api/products/:id - Delete a product
 router.delete("/:id", authMiddleware, isAdmin, async (req, res) => {
   try {
-    const deletedProduct = await Product.findByIdAndDelete(req.params.id);
+    // The ledger keeps the deleted product's history and closes its stream
+    // at zero, so later stock sheets do not carry phantom stock forward.
+    const deletedProduct = await runTransaction(async (session) => {
+      const removed = await Product.findByIdAndDelete(req.params.id, { session });
+      if (removed && ["CLOTHES", "SHOES"].includes(removed.mainCategory)) {
+        await recordStockMovement({
+          product: removed,
+          quantityDelta: -removed.stock,
+          balanceBefore: removed.stock,
+          balanceAfter: 0,
+          kind: "PRODUCT_DELETE",
+          sourceId: String(removed._id),
+          createdBy: req.user._id,
+          session,
+        });
+      }
+      return removed;
+    });
 
     if (!deletedProduct) {
       return res.status(404).json({ error: "Product not found" });

@@ -67,9 +67,26 @@ test("discounted revenue, COGS, gross profit and ownership allocations use the a
   );
 });
 
-test("pathological products cannot be discounted into a loss", () => {
-  assert.throws(() => validate(9.99, 9, 10), /Prix trop bas/);
-  assert.equal(validate(10, 9, 10).discountApplied, false);
+// Business rule (2026-10-03): the selling price set on the Product is the
+// price the POS sells at. It, and any higher price, is never refused, even
+// when it is at or below the acquisition cost (profit = selling price -
+// acquisition cost, so such a sale records a small profit or a loss).
+// Only a DISCOUNT below that normal price is limited by the floor.
+test("a product priced at or below its cost sells at its own price, but cannot be discounted further", () => {
+  assert.equal(validate(9, 9, 10, 1).discountApplied, false, "normal price below cost is accepted");
+  assert.equal(validate(9.99, 9, 10, 1).discountApplied, false, "a price above the normal price is not a discount");
+  assert.equal(validate(10, 10, 10, 1).discountApplied, false, "normal price equal to cost is accepted");
+  assert.throws(() => validate(8.5, 9, 10), /Prix trop bas/, "a discount below such a price is still refused");
+  const profit = calculateProfitSnapshot({ unitSellingPrice: 9, unitAcquisitionCost: 10, quantity: 2, mainCategory: "CLOTHES" });
+  assert.equal(profit.grossProfit, -2, "profit = (9 - 10) x 2");
+});
+
+test("an FC normal price stays sellable after the rate rises above the USD-recorded cost", () => {
+  // 20,000 FC price, cost 19,000 FC recorded as $6.67 at 2,850. At 3,100 the
+  // FC price is worth $6.45: still the product's own price, so accepted.
+  const result = validateFC(20000, 20000, 3100, 19000 / 2850, 1);
+  assert.equal(result.discountApplied, false);
+  assert.throws(() => validateFC(19500, 20000, 3100, 19000 / 2850), (error) => error.code === "PRICE_TOO_LOW");
 });
 
 

@@ -33,6 +33,7 @@ const { getFallbackExchangeRate } = require("../utils/currentExchangeRate");
 const { authorizedCategory, isShareholderAdmin } = require("../middleware/authorization");
 const { categoryRestrictedSaleStages } = require("../utils/categoryScope");
 const { acquireAccountingLocksForItems } = require("../services/financialAccountingService");
+const { recordStockMovement } = require("../services/stockMovementService");
 const { discountProbeGuard } = require("../utils/discountProbeGuard");
 class HttpError extends Error {
   constructor(status, message) {
@@ -140,7 +141,7 @@ function referencePricing(product, rate, priorItem = null) {
   return { usd, fc: ownFC ?? (rate ? Math.round(usd * rate) : undefined) };
 }
 
-function discountSnapshot(product, pricing, cartQuantity, rate, priorItem = null, { discountLimited = false } = {}) {
+function discountSnapshot(product, pricing, cartQuantity, rate, priorItem = null, { discountLimited = false, familySale = false } = {}) {
   const reference = referencePricing(product, rate, priorItem);
   const enteredInFC = pricing.enteredCurrency === "FC";
   let result;
@@ -150,6 +151,7 @@ function discountSnapshot(product, pricing, cartQuantity, rate, priorItem = null
       referenceUnitPrice: reference.usd,
       unitAcquisitionCost: priorItem?.unitAcquisitionCost ?? product.unitCost,
       cartQuantity,
+      skipQuantityRequirement: familySale,
       ...(enteredInFC ? { actualUnitPriceFC: pricing.priceFC, referenceUnitPriceFC: reference.fc } : {}),
     });
   } catch (error) {
@@ -198,7 +200,7 @@ function recordDiscountRejection(user, error) {
 // (or, for a correction, the line's own immutable snapshot), the server-side
 // exchange rate and the whole-cart quantity. Nothing is written here, so a
 // rejected discount can never leave a partial stock or sale mutation behind.
-async function priceSaleItems(items, { saleRate, priorSale = null, checkStock = false, user = null }) {
+async function priceSaleItems(items, { saleRate, priorSale = null, checkStock = false, user = null, familySale = false }) {
   if (!items || !Array.isArray(items) || items.length === 0) {
     throw new HttpError(400, "Sale must contain at least one item");
   }
@@ -238,7 +240,7 @@ async function priceSaleItems(items, { saleRate, priorSale = null, checkStock = 
     try {
       pricing = normalizeSaleItemPricing({ ...item, exchangeRate: itemRate }, itemRate);
       financials = financialSaleItem(product, pricing, Number(quantity), priorItem);
-      discount = discountSnapshot(product, pricing, cartQuantity, itemRate, priorItem, { discountLimited });
+      discount = discountSnapshot(product, pricing, cartQuantity, itemRate, priorItem, { discountLimited, familySale });
     } catch (pricingError) {
       if (pricingError instanceof DiscountValidationError) {
         pricingError.itemIndex = itemIndex;
@@ -310,6 +312,8 @@ const saleRequestFingerprint = (body = {}) => crypto.createHash("sha256").update
   customer: body.isWalkIn ? null : { name: String(body.customer?.name || "").trim(), phone: String(body.customer?.phone || "").trim() },
   isWalkIn: Boolean(body.isWalkIn), paymentMethod: normalizePaymentMethod(body.paymentMethod),
   exchangeRate: Number(body.exchangeRate), occurredAt: body.occurredAt || null,
+  isFamilySale: body.isFamilySale === true,
+  familyMemberId: body.isFamilySale === true ? String(body.familyMemberId || "") : null,
   items: (Array.isArray(body.items) ? body.items : []).map((item) => ({
     productId: String(item?.productId), quantity: Number(item?.quantity), price: Number(item?.price),
     enteredPrice: Number(item?.enteredPrice), enteredCurrency: item?.enteredCurrency,
@@ -397,6 +401,18 @@ async function updateCustomerData(customerData, saleTotal, session = null) {
     { new: true, upsert: true, runValidators: true, session }
   );
   return customer._id;
+}
+
+async function updateRegisteredCustomerData(customerId, saleTotal, session) {
+  const now = new Date();
+  const customer = await Customer.findOne({ _id: customerId, isFamilyMember: true }).session(session);
+  if (!customer) return null;
+  customer.firstPurchaseDate ||= now;
+  customer.lastPurchaseDate = now;
+  customer.totalPurchases = Number(customer.totalPurchases || 0) + 1;
+  customer.totalSpent = Number(customer.totalSpent || 0) + Number(saleTotal);
+  await customer.save({ session });
+  return customer;
 }
 
 // Helper function to attach a sale to a customer record without touching
@@ -1095,6 +1111,7 @@ router.post("/", authMiddleware, async (req, res) => {
     // 🔹 HANDLE REGULAR SALE (existing logic)
     assertCollectedPayment(paymentMethod);
     const walkIn = Boolean(isWalkIn);
+    const familySale = req.body.isFamilySale === true;
     const requestKey = saleRequestKey(req.body);
 
     // A retry of a sale that was already recorded (lost response, double
@@ -1102,6 +1119,28 @@ router.post("/", authMiddleware, async (req, res) => {
     if (requestKey) {
       const existing = await Sale.findOne({ requestKey }).select("+requestFingerprint").lean();
       if (existing) return replaySaleRequest(res, req, existing);
+    }
+
+    if (familySale) {
+      if (req.user.role !== "superadmin") {
+        return res.status(403).json({ error: "FAMILY_SALE_FORBIDDEN", message: "Seul le superadministrateur peut autoriser une vente famille." });
+      }
+      if (req.body.offline === true) {
+        return res.status(409).json({ error: "FAMILY_SALE_ONLINE_REQUIRED", message: "Une vente famille exige une validation en ligne." });
+      }
+      if (walkIn || !mongoose.isValidObjectId(req.body.familyMemberId)) {
+        return res.status(400).json({ error: "FAMILY_MEMBER_REQUIRED", message: "Sélectionnez un membre de famille enregistré." });
+      }
+      if (type && type !== "sale") {
+        return res.status(400).json({ error: "FAMILY_SALE_TYPE_INVALID", message: "Une vente famille doit être une vente immédiatement comptabilisée." });
+      }
+    }
+
+    const familyMember = familySale
+      ? await Customer.findOne({ _id: req.body.familyMemberId, isFamilyMember: true }).lean()
+      : null;
+    if (familySale && !familyMember) {
+      return res.status(400).json({ error: "FAMILY_MEMBER_INVALID", message: "Le client sélectionné n'est pas un membre de famille enregistré." });
     }
 
     const transactionExchangeRate = await resolveNewSaleExchangeRate(req.body);
@@ -1122,6 +1161,7 @@ router.post("/", authMiddleware, async (req, res) => {
       saleRate: transactionExchangeRate,
       checkStock: true,
       user: req.user,
+      familySale,
     });
 
     const financialTotals = sumFinancialSnapshots(enrichedItems);
@@ -1134,7 +1174,9 @@ router.post("/", authMiddleware, async (req, res) => {
 
     const saleNumber = `SN-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
 
-    const customerData = walkIn
+    const customerData = familySale
+      ? { name: familyMember.name, phone: familyMember.phone || "", email: familyMember.email || "" }
+      : walkIn
       ? { name: "Client de passage", phone: "", email: "" }
       : {
           name: customer.name,
@@ -1151,6 +1193,11 @@ router.post("/", authMiddleware, async (req, res) => {
       customer: customerData,
       customerId: null,
       isWalkIn: walkIn,
+      isFamilySale: familySale,
+      familyMemberId: familySale ? familyMember._id : undefined,
+      familyMemberName: familySale ? familyMember.name : undefined,
+      familyAuthorizedBy: familySale ? req.user._id : undefined,
+      familyAuthorizedAt: familySale ? new Date() : undefined,
       items: enrichedItems,
       subtotal,
       total,
@@ -1179,9 +1226,15 @@ router.post("/", authMiddleware, async (req, res) => {
         if (existing) return { replayed: existing };
       }
       // Walk-in sales never create or update a Customer record.
-      saleData.customerId = walkIn
-        ? null
-        : await updateCustomerData(customer, total, session);
+      if (familySale) {
+        const verifiedFamilyMember = await updateRegisteredCustomerData(familyMember._id, total, session);
+        if (!verifiedFamilyMember) throw new HttpError(409, "Le statut famille de ce client a changé. Actualisez puis réessayez.");
+        saleData.customerId = verifiedFamilyMember._id;
+        saleData.familyMemberName = verifiedFamilyMember.name;
+        saleData.customer = { name: verifiedFamilyMember.name, phone: verifiedFamilyMember.phone || "", email: verifiedFamilyMember.email || "" };
+      } else {
+        saleData.customerId = walkIn ? null : await updateCustomerData(customer, total, session);
+      }
 
       for (const item of enrichedItems) {
         const updated = await Product.findOneAndUpdate(
@@ -1195,6 +1248,17 @@ router.post("/", authMiddleware, async (req, res) => {
             `Stock insuffisant pour ${item.name}. Actualisez les produits puis réessayez.`
           );
         }
+        await recordStockMovement({
+          product: updated,
+          quantityDelta: -item.quantity,
+          balanceBefore: updated.stock + item.quantity,
+          balanceAfter: updated.stock,
+          kind: "SALE",
+          sourceId: requestKey || saleId,
+          // Server time: an offline sale's stock leaves the system at sync.
+          createdBy: req.user._id,
+          session,
+        });
       }
 
       const createdSales = await Sale.create([saleData], { session });
@@ -1634,6 +1698,9 @@ router.put("/:id", authMiddleware, async (req, res) => {
       saleRate: transactionExchangeRate,
       priorSale: originalSale,
       user: req.user,
+      // Only the superadmin may keep the family exception while correcting a
+      // family sale; anyone else is held to the normal quantity rule.
+      familySale: originalSale.isFamilySale === true && req.user.role === "superadmin",
     });
 
     const financialTotals = sumFinancialSnapshots(enrichedItems);
@@ -1694,6 +1761,16 @@ router.put("/:id", authMiddleware, async (req, res) => {
             "Stock insuffisant pour modifier cette vente. Actualisez puis réessayez."
           );
         }
+        await recordStockMovement({
+          product: updatedProduct,
+          quantityDelta: adjustment,
+          balanceBefore: updatedProduct.stock - adjustment,
+          balanceAfter: updatedProduct.stock,
+          kind: "SALE_CORRECTION",
+          sourceId: String(id),
+          createdBy: req.user._id,
+          session,
+        });
       }
 
       const savedSale = await Sale.findByIdAndUpdate(
@@ -1876,11 +1953,21 @@ router.patch("/:id/void", authMiddleware, async (req, res) => {
         const restoredProduct = await Product.findByIdAndUpdate(
           item.productId,
           { $inc: { stock: item.quantity } },
-          { session }
+          { new: true, session }
         );
         if (!restoredProduct) {
           throw new HttpError(409, `Produit introuvable: ${item.name}`);
         }
+        await recordStockMovement({
+          product: restoredProduct,
+          quantityDelta: item.quantity,
+          balanceBefore: restoredProduct.stock - item.quantity,
+          balanceAfter: restoredProduct.stock,
+          kind: "SALE_VOID",
+          sourceId: String(id),
+          createdBy: req.user._id,
+          session,
+        });
       }
     }
 
@@ -1976,6 +2063,16 @@ router.delete("/:id", authMiddleware, async (req, res) => {
           if (!updatedProduct) {
             throw new HttpError(409, `Produit introuvable: ${item.name}`);
           }
+          await recordStockMovement({
+            product: updatedProduct,
+            quantityDelta: item.quantity,
+            balanceBefore: updatedProduct.stock - item.quantity,
+            balanceAfter: updatedProduct.stock,
+            kind: "SALE_DELETE",
+            sourceId: String(sale._id),
+            createdBy: req.user._id,
+            session,
+          });
           if (updatedProduct) {
             console.log(`✅ Returned ${item.quantity} units of "${item.name}", new stock: ${updatedProduct.stock}`);
           } else {

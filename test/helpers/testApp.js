@@ -10,6 +10,7 @@ const { preventNoSqlInjection } = require("../../middleware/security");
 const authMiddleware = require("../../middleware/auth");
 const { MODULES, blockShareholderMutations, requireAssignedCategory, requireShareholderModule } = require("../../middleware/authorization");
 const User = require("../../models/User");
+const { productStockSheet, stockSheet, salesSheet } = require("../../routes/operationalReports");
 
 function createApp() {
   const app = express();
@@ -21,11 +22,15 @@ function createApp() {
     ...(categorySensitive ? [requireAssignedCategory] : []),
     blockShareholderMutations,
   ];
+  app.get("/api/products/stock-sheet", ...guarded([MODULES.PRODUCTS], true), stockSheet);
+  app.get("/api/products/:id/stock-sheet", ...guarded([MODULES.PRODUCTS], true), productStockSheet);
+  app.get("/api/analytics/sales-sheet", ...guarded([MODULES.REPORTS], true), salesSheet);
   app.use("/api/products", ...guarded([MODULES.PRODUCTS], true), require("../../routes/products"));
   app.use("/api/sales", ...guarded([MODULES.SALES_HISTORY], true), require("../../routes/sales"));
   app.use("/api/expenses", ...guarded([MODULES.EXPENSES]), require("../../routes/expenses"));
   app.use("/api/entries", ...guarded([MODULES.ENTRIES]), require("../../routes/entries"));
   app.use("/api/analytics", ...guarded([MODULES.REPORTS], true), require("../../routes/analytics"));
+  app.use("/api/customers", ...guarded([MODULES.CUSTOMERS]), require("../../routes/customers"));
   app.use("/api/users", require("../../routes/users"));
   return app;
 }

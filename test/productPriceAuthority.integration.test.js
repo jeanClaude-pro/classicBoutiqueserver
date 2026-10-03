@@ -240,3 +240,31 @@ itest("price probing: after repeated refusals a reduced price is refused without
   assert.equal((await ctx.sell([{ product, quantity: 5, price: 15 }], { role: "manager" })).status, 201);
   assert.equal((await ctx.sell([{ product, quantity: 5, price: 15 }], { role: "superadmin" })).status, 201);
 });
+
+// Business rule: the POS sells at the selling price defined on the Product.
+// That price is never refused ("Prix trop bas"), whatever its margin; only a
+// discount below it is limited. Profit = selling price - acquisition cost.
+itest("the Product's own selling price is always accepted, even at or below its purchase cost", async () => {
+  // USD product priced below its cost: sells at its price and records the loss.
+  const clearance = await createProduct({ price: 8, currency: "USD", unitCost: 10, rate: 2850, stock: 10 });
+  const sold = await ctx.sell([usdLine(clearance, 1, 8)], { exchangeRate: 2850 });
+  assert.equal(sold.status, 201, JSON.stringify(sold.body));
+  const line = await savedItem(sold);
+  assert.deepEqual([line.revenue, line.costOfGoodsSold, line.grossProfit], [8, 10, -2]);
+
+  // FC product: 20,000 FC price, 19,000 FC cost recorded at 2,850. The rate
+  // rises to 3,100, so the fixed FC price is now worth less than the USD
+  // cost: the normal price is still sold, never "Prix trop bas".
+  const robe = await createProduct({ price: 20000, currency: "FC", unitCost: 19000, rate: 2850, stock: 10 });
+  await ctx.setRate(3100);
+  const fcSale = await ctx.sell([fcLine(robe, 1, 20000)], { exchangeRate: 3100 });
+  assert.equal(fcSale.status, 201, JSON.stringify(fcSale.body));
+  const fcItem = await savedItem(fcSale);
+  assert.equal(fcItem.priceFC, 20000);
+  assert.equal(fcItem.discountApplied, false);
+  assert.equal(Math.round(fcItem.grossProfit * 100), Math.round(fcItem.revenue * 100) - Math.round(fcItem.costOfGoodsSold * 100));
+
+  // A discount below such a price is still limited by the floor.
+  const discounted = await ctx.sell([fcLine(robe, 5, 15000)], { exchangeRate: 3100 });
+  assert.equal(discounted.body.error, "PRICE_TOO_LOW");
+});

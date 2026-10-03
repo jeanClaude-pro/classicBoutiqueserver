@@ -115,6 +115,13 @@ const saleSchema = new mongoose.Schema({
     type: Boolean,
     default: false
   },
+  // Family-sale audit snapshot, written only by the server after verifying
+  // the superadmin role and the customer's registered family status.
+  isFamilySale: { type: Boolean, default: false },
+  familyMemberId: { type: mongoose.Schema.Types.ObjectId, ref: "Customer", default: undefined },
+  familyMemberName: { type: String, trim: true, default: undefined },
+  familyAuthorizedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: undefined },
+  familyAuthorizedAt: { type: Date, default: undefined },
   items: [saleItemSchema],
   subtotal: {
     type: Number,
