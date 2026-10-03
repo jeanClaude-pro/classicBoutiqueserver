@@ -1,4 +1,5 @@
 const nodemailer = require("nodemailer");
+const { escapeHtml, htmlSafeRecord } = require("../utils/html");
 const User = require("../models/User");
 
 const transporter = nodemailer.createTransport({
@@ -51,6 +52,7 @@ async function sendExpenseNotification(expense) {
 
 // Fonction séparée pour envoyer l'email
 async function sendEmailToRecipients(expense, recipientEmails) {
+  const safe = htmlSafeRecord(expense);
   try {
     // Formater le montant en devise
     const formattedAmount = new Intl.NumberFormat("fr-FR", {
@@ -122,19 +124,19 @@ async function sendEmailToRecipients(expense, recipientEmails) {
                         <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
                             <tr>
                                 <td style="padding: 10px 0; border-bottom: 1px solid #e5e7eb; color: #6b7280; width: 40%;"><strong>🔖 Référence:</strong></td>
-                                <td style="padding: 10px 0; border-bottom: 1px solid #e5e7eb; font-weight: 600;">${expense.expenseId}</td>
+                                <td style="padding: 10px 0; border-bottom: 1px solid #e5e7eb; font-weight: 600;">${safe.expenseId}</td>
                             </tr>
                             <tr>
                                 <td style="padding: 10px 0; border-bottom: 1px solid #e5e7eb; color: #6b7280;"><strong>📝 Motif:</strong></td>
-                                <td style="padding: 10px 0; border-bottom: 1px solid #e5e7eb; font-weight: 600;">${expense.reason}</td>
+                                <td style="padding: 10px 0; border-bottom: 1px solid #e5e7eb; font-weight: 600;">${safe.reason}</td>
                             </tr>
                             <tr>
                                 <td style="padding: 10px 0; border-bottom: 1px solid #e5e7eb; color: #6b7280;"><strong>👤 Bénéficiaire:</strong></td>
-                                <td style="padding: 10px 0; border-bottom: 1px solid #e5e7eb; font-weight: 600;">${expense.recipientName}</td>
+                                <td style="padding: 10px 0; border-bottom: 1px solid #e5e7eb; font-weight: 600;">${safe.recipientName}</td>
                             </tr>
                             <tr>
                                 <td style="padding: 10px 0; border-bottom: 1px solid #e5e7eb; color: #6b7280;"><strong>📞 Téléphone:</strong></td>
-                                <td style="padding: 10px 0; border-bottom: 1px solid #e5e7eb; font-weight: 600;">${expense.recipientPhone}</td>
+                                <td style="padding: 10px 0; border-bottom: 1px solid #e5e7eb; font-weight: 600;">${safe.recipientPhone}</td>
                             </tr>
                             <tr>
                                 <td style="padding: 10px 0; border-bottom: 1px solid #e5e7eb; color: #6b7280;"><strong>💰 Montant:</strong></td>
@@ -146,7 +148,7 @@ async function sendEmailToRecipients(expense, recipientEmails) {
                             </tr>
                             <tr>
                                 <td style="padding: 10px 0; border-bottom: 1px solid #e5e7eb; color: #6b7280;"><strong>👨‍💼 Enregistré par:</strong></td>
-                                <td style="padding: 10px 0; border-bottom: 1px solid #e5e7eb; font-weight: 600;">${expense.recordedBy}</td>
+                                <td style="padding: 10px 0; border-bottom: 1px solid #e5e7eb; font-weight: 600;">${safe.recordedBy}</td>
                             </tr>
                             <tr>
                                 <td style="padding: 10px 0; border-bottom: 1px solid #e5e7eb; color: #6b7280;"><strong>📊 Statut:</strong></td>
@@ -162,13 +164,13 @@ async function sendEmailToRecipients(expense, recipientEmails) {
                     </div>
 
                     <!-- Section des notes -->
-                    ${expense.notes ? `
+                    ${safe.notes ? `
                     <div style="background: #f0f9ff; border: 1px solid #bae6fd; border-radius: 8px; padding: 15px; margin-bottom: 20px;">
                         <h4 style="color: ${COMPANY_COLOR}; margin: 0 0 8px 0; font-size: 16px; display: flex; align-items: center;">
                             <span style="margin-right: 8px;">📝</span>
                             Notes Complémentaires
                         </h4>
-                        <p style="margin: 0; color: #1e40af; font-style: italic; line-height: 1.5;">${expense.notes}</p>
+                        <p style="margin: 0; color: #1e40af; font-style: italic; line-height: 1.5;">${safe.notes}</p>
                     </div>
                     ` : ''}
 

@@ -29,9 +29,15 @@ function createIntegrationContext() {
     await Promise.all([Sale, Expense, Product, Customer, Entry, ExchangeRate, User, AccountingLock, StockMovement].map((model) => model.init()));
     await ensureAccountingLocks();
     ctx.app = await startApp();
-    for (const role of ["superadmin", "manager", "inventory_manager", "cashier_supervisor", "staff"]) {
+    for (const role of ["superadmin", "manager", "inventory_manager", "cashier_supervisor"]) {
       ctx.users[role] = await createUser(role);
     }
+    // "staff" has no module by default (same rule as the interface); the test
+    // cashier is granted the POS and Sales History, like a real cashier.
+    ctx.users.staff = await createUser("staff", { permissions: ["/", "/sales"] });
+    ctx.users.bareStaff = await createUser("staff");
+    // A manager explicitly granted the Reports module (not a default).
+    ctx.users.reportsManager = await createUser("manager", { permissions: ["/", "/sales", "/products", "/reports"] });
     ctx.users.clothesShareholder = await createUser("admin", { assignedCategory: "CLOTHES", permissions: ["/reports", "/sales", "/products"] });
     ctx.users.shoesShareholder = await createUser("admin", { assignedCategory: "SHOES", permissions: ["/reports", "/sales", "/products"] });
   };
@@ -79,6 +85,15 @@ function createIntegrationContext() {
       paymentMethod, type, exchangeRate, requestKey,
       ...(type === "reservation" || customer ? { customer: customer || { name: "Client", phone: `09${Math.floor(Math.random() * 1e8)}` } } : { isWalkIn: true }),
     };
+    if (type === "reservation") {
+      // Reservations can no longer be created through the API (the module was
+      // retired); legacy pending reservations are reproduced by recording the
+      // sale and turning it into the historical record shape.
+      const created = await ctx.request("POST", "/sales", { token: ctx.token(role), body: { ...body, type: "sale" } });
+      if (created.status !== 201) return created;
+      await Sale.collection.updateOne({ _id: new mongoose.Types.ObjectId(String(created.body._id)) }, { $set: { type: "reservation", status: "pending" } });
+      return { ...created, body: { ...created.body, type: "reservation", status: "pending" } };
+    }
     return ctx.request("POST", "/sales", { token: ctx.token(role), body });
   };
 

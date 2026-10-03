@@ -8,10 +8,14 @@ const { normalizeAmountSnapshot } = require("../utils/salePricing");
 const { getFallbackExchangeRate } = require("../utils/currentExchangeRate");
 
 const router = express.Router();
-const adminOnly = (req, res, next) => req.user?.role === "superadmin" ? next() : res.status(403).json({ error: "Superadministrator access required" });
-const clean = (value) => String(value || "").trim();
+const { validateObjectIdParam } = require("../middleware/security");
+const { requireModuleAccess } = require("../middleware/moduleAccess");
+router.param("id", validateObjectIdParam("creditor ID"));
+const adminOnly= (req, res, next) => req.user?.role === "superadmin" ? next() : res.status(403).json({ error: "Superadministrator access required" });
+const clean = (value, maxLength = 200) => (value !== null && typeof value === "object") ? "" : String(value || "").trim().slice(0, maxLength);
 
-router.get("/selector", auth, async (_req, res) => {
+// The expense form (Sorties) picks the creditor of a repayment.
+router.get("/selector", auth, requireModuleAccess("/sortie", "/sortiehistory", "/remboursements"), async (_req, res) => {
   const rows = await Creditor.find({ isActive: true }).select("name type phone").sort({ name: 1 }).lean();
   res.json(rows);
 });

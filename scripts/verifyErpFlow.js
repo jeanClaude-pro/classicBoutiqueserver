@@ -24,6 +24,12 @@ async function request(path, options = {}) {
 
 async function verifyErpFlow() {
   if (!process.env.MONGO_URI) throw new Error("MONGO_URI is required");
+  // This script creates and deletes users, products and sales: it must never
+  // run against a shared or production database.
+  const { hostname } = new URL(process.env.MONGO_URI.replace(/^mongodb(\+srv)?:/, "http:"));
+  if (!["localhost", "127.0.0.1", "::1", "[::1]"].includes(hostname)) {
+    throw new Error("verifyErpFlow only runs against a local MongoDB (MONGO_URI host must be localhost)");
+  }
   await mongoose.connect(process.env.MONGO_URI);
 
   const user = await User.create({

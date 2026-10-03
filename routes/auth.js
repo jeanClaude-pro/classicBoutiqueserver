@@ -2,44 +2,57 @@
 const express = require("express");
 const router = express.Router();
 const User = require("../models/User");
+const RevokedToken = require("../models/RevokedToken");
 const bcrypt = require("bcryptjs");
 const generateToken = require("../utils/generateToken");
+const authMiddleware = require("../middleware/auth");
 const { rateLimit } = require("express-rate-limit");
+const { loginThrottleGuard, recordLoginFailure, recordLoginSuccess } = require("../middleware/loginThrottle");
+const { recordAudit } = require("../services/auditLog");
 
-const loginLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  limit: 10,
-  standardHeaders: true,
-  legacyHeaders: false,
-  skipSuccessfulRequests: true,
-  message: { message: "Too many login attempts. Please try again later." },
-});
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const INVALID_CREDENTIALS = { message: "Invalid email or password" };
 
+// Sign-up abuse limit. No rate-limit headers: they would reveal the window.
 const registerLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
   limit: 5,
-  standardHeaders: true,
+  standardHeaders: false,
   legacyHeaders: false,
-  message: { message: "Too many signup attempts. Please try again later." },
+  message: { message: "Too many attempts. Please try again later." },
 });
 
-// Helper: basic field guard
-function required(...fields) {
-  return fields.every((f) => typeof f === "string" && f.trim().length > 0);
+// Constant-cost comparison target for unknown emails, so response time does
+// not reveal whether an account exists.
+const DUMMY_HASH = bcrypt.hashSync("dummy-password-for-timing", 10);
+
+function safeUser(user) {
+  return {
+    id: user._id.toString(),
+    username: user.username,
+    email: user.email,
+    role: user.role,
+    assignedCategory: user.assignedCategory,
+    isActive: user.isActive,
+    permissions: user.permissions || [],
+    actionPermissions: user.actionPermissions || [],
+    createdAt: user.createdAt,
+    updatedAt: user.updatedAt,
+  };
 }
 
-// Public signup always creates a least-privileged staff account. Roles and
-// permissions remain admin-controlled after registration.
+// Public sign-up creates a least-privileged staff account that stays inactive
+// until a superadministrator activates it. No session token is issued.
 router.post("/register", registerLimiter, async (req, res) => {
   try {
-    const username = String(req.body?.username || "").trim();
-    const email = String(req.body?.email || "").trim().toLowerCase();
-    const password = String(req.body?.password || "");
+    const username = typeof req.body?.username === "string" ? req.body.username.trim() : "";
+    const email = typeof req.body?.email === "string" ? req.body.email.trim().toLowerCase() : "";
+    const password = typeof req.body?.password === "string" ? req.body.password : "";
 
     if (!username || username.length > 80) {
       return res.status(400).json({ message: "Le nom d'utilisateur est requis (80 caractères maximum)" });
     }
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) {
+    if (!EMAIL_PATTERN.test(email) || email.length > 254) {
       return res.status(400).json({ message: "Adresse email invalide" });
     }
     if (password.length < 10 || password.length > 128) {
@@ -51,88 +64,75 @@ router.post("/register", registerLimiter, async (req, res) => {
       email,
       password: await bcrypt.hash(password, 10),
       role: "staff",
-      isActive: true,
+      isActive: false,
     });
-    const token = generateToken({ id: user._id });
+    await recordAudit({ req, actor: user, action: "USER_REGISTERED", targetType: "User", targetId: user._id, after: { username, email, role: "staff", isActive: false } });
 
     return res.status(201).json({
-      user: {
-        id: user._id.toString(),
-        username: user.username,
-        email: user.email,
-        role: user.role,
-        assignedCategory: user.assignedCategory,
-        isActive: user.isActive,
-        permissions: user.permissions || [],
-        actionPermissions: user.actionPermissions || [],
-        createdAt: user.createdAt,
-        updatedAt: user.updatedAt,
-      },
-      token,
+      pendingActivation: true,
+      message: "Compte créé. Un administrateur doit l'activer avant la première connexion.",
     });
   } catch (error) {
     if (error.code === 11000) {
       return res.status(409).json({ message: "Cet email est déjà utilisé" });
     }
-    console.error("Error registering user:", error);
+    console.error("Error registering user:", error?.name || "Error");
     return res.status(500).json({ message: "Internal server error" });
   }
 });
 
-router.post("/login", loginLimiter, async (req, res) => {
+router.post("/login", loginThrottleGuard, async (req, res) => {
+  const email = typeof req.body?.email === "string" ? req.body.email.trim().toLowerCase() : "";
+  const password = typeof req.body?.password === "string" ? req.body.password : "";
   try {
-    let { email, password } = req.body || {};
-    email = (email || "").trim().toLowerCase();
-    password = String(password || "");
-
-    if (!required(email, password) || email.length > 254 || password.length > 128 ||
-        !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    if (!email || !password || email.length > 254 || password.length > 128 || !EMAIL_PATTERN.test(email)) {
       return res.status(400).json({ message: "Missing credentials" });
     }
 
-    // 1) DO NOT exclude password here; we need it to compare
-    // If your schema had `select: false` for password, you'd use `.select("+password")` instead.
-    const user = await User.findOne({ email }).select("+password");
-    if (!user) {
-      return res.status(401).json({ message: "Invalid email or password" });
+    const user = await User.findOne({ email }).select("+password +tokenVersion");
+    // Unknown email and wrong password are indistinguishable to the caller.
+    const ok = await bcrypt.compare(password, user?.password || DUMMY_HASH);
+    if (!user || !ok) {
+      const { accountLocked, ipLocked } = await recordLoginFailure(req, email);
+      await recordAudit({ req, actor: user || { username: email }, action: "LOGIN_FAILED", outcome: "failure", targetType: "User", targetId: user?._id, details: { email } });
+      if (accountLocked || ipLocked) {
+        await recordAudit({ req, actor: user || { username: email }, action: "LOGIN_LOCKOUT", outcome: "failure", targetType: "User", targetId: user?._id, details: { email, scope: accountLocked ? "account" : "ip" } });
+      }
+      return res.status(401).json(INVALID_CREDENTIALS);
     }
 
-    // 2) Compare plain password with stored hash
-    const ok = await bcrypt.compare(password, user.password);
-    if (!ok) {
-      return res.status(401).json({ message: "Invalid email or password" });
-    }
-
-    // 2b) Check if account is active
+    // Only someone who knows the password learns that the account is inactive.
     if (!user.isActive) {
-      return res.status(403).json({ message: "Votre compte a été désactivé. Contactez un administrateur." });
+      return res.status(403).json({ code: "ACCOUNT_DISABLED", message: "Votre compte est désactivé ou en attente d'activation. Contactez un administrateur." });
     }
 
-    // 3) Create token AFTER successful compare
-    const token = generateToken({ id: user._id });
-
-    // 4) Return a safe user payload (don’t send the password/hash)
-    const safeUser = {
-      id: user._id.toString(),
-      username: user.username,
-      email: user.email,
-      role: user.role,
-      assignedCategory: user.assignedCategory,
-      isActive: user.isActive,
-      permissions: user.permissions || [],
-      actionPermissions: user.actionPermissions || [],
-      createdAt: user.createdAt,
-      updatedAt: user.updatedAt,
-    };
-
-    // Optional: console.log minimal info (avoid logging tokens in prod)
-    console.log("User logged in:", safeUser.id);
-
-    return res.status(200).json({ user: safeUser, token });
+    await recordLoginSuccess(req, email);
+    const token = generateToken(user);
+    console.log("User logged in:", user._id.toString());
+    return res.status(200).json({ user: safeUser(user), token });
   } catch (error) {
-    console.error("Error logging in user:", error);
+    console.error("Error logging in user:", error?.name || "Error");
     return res.status(500).json({ message: "Internal server error" });
   }
 });
-//hello
+
+// Ends this session server-side: the token's id is revoked until it expires.
+router.post("/logout", authMiddleware, async (req, res) => {
+  try {
+    const { jti, exp } = req.auth || {};
+    if (jti && exp) {
+      await RevokedToken.updateOne(
+        { jti },
+        { $setOnInsert: { jti, userId: req.user._id, expiresAt: new Date(exp * 1000) } },
+        { upsert: true }
+      );
+    }
+    await recordAudit({ req, action: "LOGOUT", targetType: "User", targetId: req.user._id });
+    return res.json({ success: true });
+  } catch (error) {
+    console.error("Error logging out:", error?.name || "Error");
+    return res.status(500).json({ message: "Internal server error" });
+  }
+});
+
 module.exports = router;

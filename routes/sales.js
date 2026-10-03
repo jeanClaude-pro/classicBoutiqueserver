@@ -35,6 +35,30 @@ const { categoryRestrictedSaleStages } = require("../utils/categoryScope");
 const { acquireAccountingLocksForItems } = require("../services/financialAccountingService");
 const { recordStockMovement } = require("../services/stockMovementService");
 const { discountProbeGuard } = require("../utils/discountProbeGuard");
+const { requireRole, validateObjectIdParam } = require("../middleware/security");
+const { requireModuleAccess } = require("../middleware/moduleAccess");
+const { recordAudit } = require("../services/auditLog");
+const { boundedString, isObjectId } = require("../utils/validation");
+
+router.param("id", validateObjectIdParam("sale ID"));
+
+// Module access mirrors the interface: the POS ("/") records sales, Sales
+// History ("/sales") reads and corrects them.
+const canUsePosOrHistory = requireModuleAccess("/", "/sales");
+const canUseHistory = requireModuleAccess("/sales");
+// Correcting a completed sale changes stock and money: superadmin and manager.
+const canCorrectSales = requireRole("superadmin", "manager");
+const MAX_SALE_ITEMS = 200;
+const MAX_NOTES_LENGTH = 1000;
+
+// Customer data stored on a sale: bounded strings only, never raw objects.
+function cleanCustomerInput(customer) {
+  return {
+    name: boundedString(customer?.name, 120),
+    phone: boundedString(customer?.phone, 30),
+    email: boundedString(customer?.email, 254).toLowerCase(),
+  };
+}
 class HttpError extends Error {
   constructor(status, message) {
     super(message);
@@ -204,6 +228,9 @@ async function priceSaleItems(items, { saleRate, priorSale = null, checkStock = 
   if (!items || !Array.isArray(items) || items.length === 0) {
     throw new HttpError(400, "Sale must contain at least one item");
   }
+  if (items.length > MAX_SALE_ITEMS) {
+    throw new HttpError(400, `A sale cannot contain more than ${MAX_SALE_ITEMS} lines`);
+  }
   let cartQuantity;
   try {
     cartQuantity = totalPhysicalQuantity(items);
@@ -215,7 +242,7 @@ async function priceSaleItems(items, { saleRate, priorSale = null, checkStock = 
   const enrichedItems = [];
   for (const [itemIndex, item] of items.entries()) {
     const { productId, quantity, price, name } = item || {};
-    if (!productId || !quantity || quantity <= 0 || !price || price < 0) {
+    if (!productId || !isObjectId(String(productId)) || !quantity || quantity <= 0 || !price || price < 0) {
       throw new HttpError(400, "Each item requires productId, quantity>0, and price>=0");
     }
 
@@ -252,7 +279,7 @@ async function priceSaleItems(items, { saleRate, priorSale = null, checkStock = 
 
     enrichedItems.push({
       productId: new mongoose.Types.ObjectId(productId),
-      name: name || product.name,
+      name: boundedString(name, 200) || product.name,
       quantity: Number(quantity),
       // The exact entered-currency snapshot. The separately stored
       // unitSellingPrice is the cent-rounded accounting value used by revenue.
@@ -688,7 +715,7 @@ function getTimeframeDescription(query) {
  * Timeframe-based pagination (no numeric pagination)
  * Priority: custom range > specific day > month > year > today (default)
  */
-router.get("/", authMiddleware, async (req, res) => {
+router.get("/", authMiddleware, canUsePosOrHistory, async (req, res) => {
   try {
     const { 
       customerPhone, 
@@ -713,8 +740,8 @@ router.get("/", authMiddleware, async (req, res) => {
     }
     
     // 2. Apply customer phone filter if provided
-    if (customerPhone) {
-      filter["customer.phone"] = customerPhone;
+    if (typeof customerPhone === "string" && customerPhone) {
+      filter["customer.phone"] = customerPhone.slice(0, 30);
     }
 
     if (paymentMethod) {
@@ -723,7 +750,7 @@ router.get("/", authMiddleware, async (req, res) => {
     }
 
     if (search) {
-      const escapedSearch = String(search).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const escapedSearch = String(search).trim().slice(0, 100).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       const searchRegex = { $regex: escapedSearch, $options: "i" };
       filter.$or = [
         { saleId: searchRegex },
@@ -980,7 +1007,7 @@ router.get("/", authMiddleware, async (req, res) => {
 // ==================== ALL OTHER ROUTES REMAIN UNCHANGED ====================
 
 /** ---------- DAILY STATS FIRST (before :id) ---------- **/
-router.get("/stats/daily", authMiddleware, async (req, res) => {
+router.get("/stats/daily", authMiddleware, canUsePosOrHistory, async (req, res) => {
   try {
     if (isShareholderAdmin(req.user)) return res.status(403).json({ error: "Use the authorized Sales History module" });
     const businessDate = canReadHistory(req.user) && req.query.date ? String(req.query.date) : currentBusinessDate();
@@ -1037,75 +1064,24 @@ router.get("/stats/daily", authMiddleware, async (req, res) => {
 });
 
 /** ---------- CREATE SALE OR EXPENSE ---------- **/
-router.post("/", authMiddleware, async (req, res) => {
+router.post("/", authMiddleware, requireModuleAccess("/"), async (req, res) => {
   try {
     const {
-      customer,
       items,
       paymentMethod,
-      salesPerson,
       type,
-      reservationDate,
-      reservationTime,
-      notes,
       isWalkIn,
-      // 🔹 NEW EXPENSE FIELDS
-      reason,
-      recipientName,
-      recipientPhone,
-      amount,
-      recordedBy
     } = req.body;
+    const customer = req.body.customer && typeof req.body.customer === "object" ? cleanCustomerInput(req.body.customer) : null;
+    const notes = boundedString(req.body.notes, MAX_NOTES_LENGTH);
 
     const normalizedPM = normalizePaymentMethod(paymentMethod);
 
-    // 🔹 HANDLE EXPENSE TYPE
-    if (type === "expense") {
-      if (!reason || !recipientName || !recipientPhone || !amount) {
-        return res.status(400).json({ 
-          error: "Expense requires reason, recipientName, recipientPhone, and amount" 
-        });
-      }
-
-      const expenseAmount = parseFloat(amount);
-      if (isNaN(expenseAmount) || expenseAmount <= 0) {
-        return res.status(400).json({ 
-          error: "Amount must be a positive number" 
-        });
-      }
-
-      const saleId = `EXP-${Date.now()}-${Math.random()
-        .toString(36)
-        .substr(2, 5)
-        .toUpperCase()}`;
-
-      const saleNumber = `EXP-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-
-      const expenseData = {
-        saleId,
-        saleNumber,
-        customer: {
-          name: recipientName,
-          phone: recipientPhone,
-          email: "",
-        },
-        items: [], // No items for expenses
-        subtotal: expenseAmount,
-        total: expenseAmount,
-        paymentMethod: normalizedPM,
-        status: "expense", // 🔹 Special status for expenses
-        salesPerson: recordedBy || salesPerson || "Admin",
-        type: "expense",
-        reason: reason,
-        recipientName: recipientName,
-        recipientPhone: recipientPhone,
-        notes: notes || ""
-      };
-
-      const expense = new Sale(expenseData);
-      const savedExpense = await expense.save();
-
-      return res.status(201).json(savedExpense);
+    // Only immediate sales are recorded here. Reservations were retired from
+    // the interface and cash-outs live in /api/expenses; neither may be
+    // created through this endpoint any more.
+    if (type !== undefined && type !== null && type !== "" && type !== "sale") {
+      return res.status(400).json({ error: "SALE_TYPE_INVALID", message: "Seules les ventes immédiates peuvent être enregistrées." });
     }
 
     // 🔹 HANDLE REGULAR SALE (existing logic)
@@ -1184,7 +1160,7 @@ router.post("/", authMiddleware, async (req, res) => {
           email: customer.email || "",
         };
 
-    const effectiveSaleType = type || "sale";
+    const effectiveSaleType = "sale";
 
     // UPDATED: Include type and reservation fields WITH CORRECT STATUS
     const saleData = {
@@ -1204,17 +1180,20 @@ router.post("/", authMiddleware, async (req, res) => {
       ...financialTotals,
       exchangeRate: transactionExchangeRate,
       paymentMethod: normalizedPM,
-      status: type === "reservation" ? "pending" : "completed", // ✅ FIXED: Reservations as pending (money received)
-      salesPerson: salesPerson || "Admin",
+      status: "completed",
+      // Attribution always comes from the authenticated session.
+      salesPerson: req.user.username || req.user.email,
       type: effectiveSaleType,
-      reservationDate: reservationDate || null,
-      reservationTime: reservationTime || null,
-      notes: notes || "",
+      reservationDate: null,
+      reservationTime: null,
+      notes,
       requestKey,
       clientSaleId: requestKey || undefined,
       receiptNumber: typeof req.body.receiptNumber === "string" ? req.body.receiptNumber.trim().slice(0, 120) : undefined,
       requestFingerprint: requestKey ? saleRequestFingerprint(req.body) : undefined,
-      occurredAt: req.body.occurredAt ? new Date(req.body.occurredAt) : undefined,
+      // Only a validated offline sale keeps its client time (checked against
+      // the historical rate above); every other sale is dated by the server.
+      occurredAt: req.body.offline === true && req.body.occurredAt ? new Date(req.body.occurredAt) : undefined,
       createdBy: req.user._id,
     };
 
@@ -1266,6 +1245,16 @@ router.post("/", authMiddleware, async (req, res) => {
     });
 
     if (savedSale.replayed) return replaySaleRequest(res, req, savedSale.replayed);
+    const discountedLines = enrichedItems.filter((item) => item.discountApplied);
+    if (discountedLines.length || familySale) {
+      await recordAudit({
+        req, action: familySale ? "SALE_FAMILY_RECORDED" : "SALE_DISCOUNT_APPLIED", targetType: "Sale", targetId: savedSale._id,
+        details: {
+          saleId: savedSale.saleId, total: savedSale.total,
+          lines: discountedLines.map((item) => ({ productId: item.productId, name: item.name, quantity: item.quantity, unitPrice: item.price, referenceUnitPrice: item.referenceUnitSellingPrice, discountPerUnit: item.discountPerUnit })),
+        },
+      });
+    }
     return res.status(201).json(safeSaleResponse(savedSale, req.user));
   } catch (error) {
     const requestKey = saleRequestKey(req.body);
@@ -1278,6 +1267,7 @@ router.post("/", authMiddleware, async (req, res) => {
       // Audit trail of refused discounts; the floor itself is never logged.
       console.warn("Sale discount rejected", { user: req.user?.username, code: error.code, itemIndex: error.itemIndex });
       recordDiscountRejection(req.user, error);
+      await recordAudit({ req, action: "SALE_DISCOUNT_REJECTED", outcome: "failure", targetType: "Sale", details: { code: error.code, itemIndex: error.itemIndex } });
       return sendDiscountError(res, error);
     }
     console.error("Error creating sale/expense:", error);
@@ -1288,7 +1278,7 @@ router.post("/", authMiddleware, async (req, res) => {
 // ==================== MODIFIED ENDPOINTS (REMOVE PAGINATION) ====================
 
 /** ---------- GET EXPENSES (TIME FRAME BASED) ---------- **/
-router.get("/expenses/all", authMiddleware, async (req, res) => {
+router.get("/expenses/all", authMiddleware, canUseHistory, async (req, res) => {
   try {
     if (isShareholderAdmin(req.user)) return res.status(403).json({ error: "Expense data is not available through Sales History" });
     const { 
@@ -1354,7 +1344,7 @@ router.get("/expenses/all", authMiddleware, async (req, res) => {
 });
 
 /** ---------- GET RESERVATIONS (TIME FRAME BASED) ---------- **/
-router.get("/reservations/all", authMiddleware, async (req, res) => {
+router.get("/reservations/all", authMiddleware, canUseHistory, async (req, res) => {
   try {
     if (isShareholderAdmin(req.user)) return res.status(403).json({ error: "Reservation operations are not available to shareholder accounts" });
     const { 
@@ -1393,7 +1383,7 @@ router.get("/reservations/all", authMiddleware, async (req, res) => {
     }
     if (paymentMethod) filter.paymentMethod = normalizePaymentMethod(paymentMethod);
     if (search) {
-      const escaped = String(search).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const escaped = String(search).trim().slice(0, 100).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       const regex = { $regex: escaped, $options: "i" };
       filter.$or = [
         { saleId: regex },
@@ -1475,7 +1465,7 @@ router.get("/reservations/all", authMiddleware, async (req, res) => {
 // ==================== ALL OTHER ROUTES REMAIN EXACTLY THE SAME ====================
 
 /** ---------- GET BY ID (after other specific routes) ---------- **/
-router.get("/:id", authMiddleware, async (req, res) => {
+router.get("/:id", authMiddleware, canUsePosOrHistory, async (req, res) => {
   try {
     const saleId = req.params.id;
     
@@ -1536,24 +1526,24 @@ router.get("/:id", authMiddleware, async (req, res) => {
 });
 
 /** ---------- EDIT SALE (Role-Based Restrictions) ---------- **/
-router.put("/:id", authMiddleware, async (req, res) => {
+router.put("/:id", authMiddleware, canUseHistory, canCorrectSales, async (req, res) => {
   try {
     const { id } = req.params;
     const {
-      customer,
       items,
       paymentMethod,
-      reason,
       type,
       reservationDate,
       reservationTime,
-      notes,
       isWalkIn,
       // Expense fields
       recipientName,
       recipientPhone,
       amount
     } = req.body;
+    const customer = req.body.customer && typeof req.body.customer === "object" ? cleanCustomerInput(req.body.customer) : null;
+    const notes = boundedString(req.body.notes, MAX_NOTES_LENGTH);
+    const reason = boundedString(req.body.reason, 500);
 
     // Find the original sale
     const originalSale = await Sale.findById(id).lean();
@@ -1595,8 +1585,11 @@ router.put("/:id", authMiddleware, async (req, res) => {
 
     const normalizedPM = normalizePaymentMethod(paymentMethod);
 
-    // 🔹 HANDLE EXPENSE EDITING
+    // 🔹 HANDLE EXPENSE EDITING (legacy expense rows: superadmin only)
     if (originalSale.type === "expense" || type === "expense") {
+      if (req.user.role !== "superadmin") {
+        return res.status(403).json({ error: "Only the superadministrator can edit legacy expense records" });
+      }
       if (!reason || !recipientName || !recipientPhone || !amount) {
         return res.status(400).json({ 
           error: "Expense requires reason, recipientName, recipientPhone, and amount" 
@@ -1650,6 +1643,7 @@ router.put("/:id", authMiddleware, async (req, res) => {
         { new: true, runValidators: true }
       );
 
+      await recordAudit({ req, action: "LEGACY_EXPENSE_EDITED", targetType: "Sale", targetId: id, details: { changes: Object.fromEntries(changes) } });
       return res.json(updatedExpense);
     }
 
@@ -1818,11 +1812,18 @@ router.put("/:id", authMiddleware, async (req, res) => {
       return savedSale;
     });
 
+    await recordAudit({
+      req, action: "SALE_CORRECTED", targetType: "Sale", targetId: id,
+      before: { total: originalSale.total, paymentMethod: originalSale.paymentMethod, customer: originalSale.customer, items: financialSummary(originalSale).items },
+      after: { total: updatedSale.total, paymentMethod: updatedSale.paymentMethod, customer: updatedSale.customer, items: financialSummary(updatedSale).items },
+      details: { saleId: originalSale.saleId, reason: reason || "Sale correction" },
+    });
     res.json(safeSaleResponse(updatedSale, req.user));
   } catch (error) {
     if (error instanceof DiscountValidationError) {
       console.warn("Sale correction discount rejected", { user: req.user?.username, code: error.code, itemIndex: error.itemIndex });
       recordDiscountRejection(req.user, error);
+      await recordAudit({ req, action: "SALE_DISCOUNT_REJECTED", outcome: "failure", targetType: "Sale", targetId: req.params.id, details: { code: error.code, itemIndex: error.itemIndex, correction: true } });
       return sendDiscountError(res, error);
     }
     console.error("Error editing sale:", error);
@@ -1834,10 +1835,9 @@ router.put("/:id", authMiddleware, async (req, res) => {
 });
 
 /** ---------- MARK RESERVATION AS COMPLETED ---------- **/
-router.patch("/:id/complete", authMiddleware, async (req, res) => {
+router.patch("/:id/complete", authMiddleware, canUseHistory, canCorrectSales, async (req, res) => {
   try {
     const { id } = req.params;
-    const { completedBy } = req.body;
 
     const sale = await Sale.findById(id).lean();
     if (!sale || (!canReadHistory(req.user) && !isWithinToday(sale.createdAt))) {
@@ -1859,7 +1859,7 @@ router.patch("/:id/complete", authMiddleware, async (req, res) => {
       {
         status: "completed",
         completedAt: new Date(),
-        completedBy: completedBy || req.user.userId,
+        completedBy: req.user.userId,
         $push: { editHistory: { editedBy: req.user.username, editedAt: new Date(), changes: { status: { from: "pending", to: "completed" } }, reason: "Reservation completed" } },
       },
       { new: true }
@@ -1868,6 +1868,7 @@ router.patch("/:id/complete", authMiddleware, async (req, res) => {
     if (!updatedSale) {
       return res.status(409).json({ error: "Reservation status changed; refresh and retry" });
     }
+    await recordAudit({ req, action: "RESERVATION_COMPLETED", targetType: "Sale", targetId: id, before: { status: "pending" }, after: { status: "completed" } });
     res.json(safeSaleResponse(updatedSale, req.user));
   } catch (error) {
     console.error("Error completing reservation:", error);
@@ -1876,7 +1877,7 @@ router.patch("/:id/complete", authMiddleware, async (req, res) => {
 });
 
 /** ---------- MARK RESERVATION AS PENDING ---------- **/
-router.patch("/:id/pending", authMiddleware, async (req, res) => {
+router.patch("/:id/pending", authMiddleware, canUseHistory, canCorrectSales, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -1916,6 +1917,7 @@ router.patch("/:id/pending", authMiddleware, async (req, res) => {
       if (!updated) throw new HttpError(409, "Only a completed reservation can return to pending");
       return updated;
     });
+    await recordAudit({ req, action: "RESERVATION_REOPENED", targetType: "Sale", targetId: id, before: { status: "completed" }, after: { status: "pending" } });
     res.json(safeSaleResponse(updatedSale, req.user));
   } catch (error) {
     console.error("Error setting reservation to pending:", error);
@@ -1931,7 +1933,7 @@ router.patch("/:id/void", authMiddleware, async (req, res) => {
     }
 
     const { id } = req.params;
-    const { reason } = req.body;
+    const reason = boundedString(req.body?.reason, 500);
 
     const voidedSale = await runTransaction(async (session) => {
     const sale = await Sale.findById(id).session(session).lean();
@@ -1997,6 +1999,11 @@ router.patch("/:id/void", authMiddleware, async (req, res) => {
     return updatedSale;
     });
 
+    await recordAudit({
+      req, action: "SALE_VOIDED", targetType: "Sale", targetId: id,
+      after: { status: "voided" },
+      details: { saleId: voidedSale.saleId, total: voidedSale.total, reason: reason || "Sale voided", items: (voidedSale.items || []).map((item) => ({ productId: item.productId, name: item.name, quantity: item.quantity })) },
+    });
     res.json(safeSaleResponse(voidedSale, req.user));
   } catch (error) {
     console.error("Error voiding sale:", error);
@@ -2084,6 +2091,10 @@ router.delete("/:id", authMiddleware, async (req, res) => {
         }
       }
     }
+
+    // The full record survives in the audit trail, written in the same
+    // transaction so a deletion can never happen without it.
+    await recordAudit({ req, action: "SALE_DELETED", targetType: "Sale", targetId: sale._id, before: sale, session });
 
     // Delete the sale record
     await Sale.findByIdAndDelete(req.params.id, { session });

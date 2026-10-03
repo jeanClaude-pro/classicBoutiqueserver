@@ -14,9 +14,9 @@ test("protected business routers enforce server-side authentication", () => {
 });
 
 test("login is rate limited and password hashes are excluded by default", () => {
-  assert.match(read("routes/auth.js"), /router\.post\("\/login", loginLimiter/);
+  assert.match(read("routes/auth.js"), /router\.post\("\/login", loginThrottleGuard/);
   assert.match(read("models/User.js"), /password:[\s\S]*?select: false/);
-  assert.match(read("routes/auth.js"), /\.select\("\+password"\)/);
+  assert.match(read("routes/auth.js"), /\.select\("\+password[^"]*"\)/);
 });
 
 test("NoSQL operators are rejected before reaching routes", () => {

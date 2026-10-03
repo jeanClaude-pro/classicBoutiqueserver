@@ -4,8 +4,14 @@ const Expense = require("../models/Expense");
 const Creditor = require("../models/Creditor");
 const mongoose = require("mongoose");
 const authMiddleware = require("../middleware/auth");
-const { requireRole } = require("../middleware/security");
+const { requireRole, validateObjectIdParam } = require("../middleware/security");
+const { requireModuleAccess } = require("../middleware/moduleAccess");
+const { recordAudit } = require("../services/auditLog");
+const { literalSearchRegex } = require("../utils/validation");
+// Endpoints without pagination never return more than this many rows.
+const MAX_UNPAGED_ROWS = 1000;
 const nodemailer = require("nodemailer");
+const { escapeHtml, htmlSafeRecord } = require("../utils/html");
 const { normalizeAmountSnapshot } = require("../utils/salePricing");
 const { getFallbackExchangeRate } = require("../utils/currentExchangeRate");
 const { calculateValidationRate } = require("../utils/financialCalculations");
@@ -23,7 +29,20 @@ const {
   parsePagination,
 } = require("../utils/queryHelpers");
 
-router.use(authMiddleware, requireRole("superadmin", "manager", "inventory_manager", "cashier_supervisor"));
+router.use(
+  authMiddleware,
+  requireRole("superadmin", "manager", "inventory_manager", "cashier_supervisor"),
+  requireModuleAccess("/sortie", "/sortiehistory")
+);
+router.param("id", validateObjectIdParam("expense ID"));
+
+// A pending expense belongs to the account that requested it (server-set
+// requestedBy). Legacy rows without requestedBy fall back to recordedBy.
+function isExpenseOwner(expense, user) {
+  if (!user) return false;
+  if (expense.requestedBy) return String(expense.requestedBy) === String(user._id);
+  return expense.recordedBy === user.id || expense.recordedBy === user.username;
+}
 
 // ✅ CREATE EMAIL TRANSPORTER
 const transporter = nodemailer.createTransport({
@@ -187,6 +206,7 @@ function getTimeframeDescription(query) {
 
 // ✅ EMAIL FUNCTIONS
 async function sendExpenseNotification(expense) {
+  const safe = htmlSafeRecord(expense);
   try {
     const adminEmails = process.env.ADMIN_EMAILS ? 
       process.env.ADMIN_EMAILS.split(',') : 
@@ -220,16 +240,16 @@ async function sendExpenseNotification(expense) {
           <div class="container">
             <div class="header">
               <h2>Nouvelle Dépense Créée</h2>
-              <p>Dépense ID: ${expense.expenseId}</p>
+              <p>Dépense ID: ${safe.expenseId}</p>
             </div>
             <div class="content">
               <div class="detail"><span class="label">Statut:</span> <strong>EN ATTENTE</strong></div>
-              <div class="detail"><span class="label">Raison:</span> ${expense.reason}</div>
-              <div class="detail"><span class="label">Bénéficiaire:</span> ${expense.recipientName}</div>
-              <div class="detail"><span class="label">Téléphone:</span> ${expense.recipientPhone}</div>
+              <div class="detail"><span class="label">Raison:</span> ${safe.reason}</div>
+              <div class="detail"><span class="label">Bénéficiaire:</span> ${safe.recipientName}</div>
+              <div class="detail"><span class="label">Téléphone:</span> ${safe.recipientPhone}</div>
               <div class="detail"><span class="label">Montant:</span> ${formattedAmount}</div>
-              <div class="detail"><span class="label">Méthode de paiement:</span> ${expense.paymentMethod}</div>
-              <div class="detail"><span class="label">Enregistré par:</span> ${expense.recordedBy}</div>
+              <div class="detail"><span class="label">Méthode de paiement:</span> ${safe.paymentMethod}</div>
+              <div class="detail"><span class="label">Enregistré par:</span> ${safe.recordedBy}</div>
               <div class="detail"><span class="label">Date:</span> ${new Date(expense.createdAt).toLocaleString('fr-FR')}</div>
               
               <div class="action">
@@ -256,6 +276,7 @@ async function sendExpenseNotification(expense) {
 }
 
 async function sendExpenseUpdateNotification(expense, updatedBy, updateReason) {
+  const safe = htmlSafeRecord(expense);
   try {
     const adminEmails = process.env.ADMIN_EMAILS ? 
       process.env.ADMIN_EMAILS.split(',') : 
@@ -289,15 +310,15 @@ async function sendExpenseUpdateNotification(expense, updatedBy, updateReason) {
           <div class="container">
             <div class="header">
               <h2>Mise à Jour de Dépense</h2>
-              <p>Dépense ID: ${expense.expenseId}</p>
+              <p>Dépense ID: ${safe.expenseId}</p>
             </div>
             <div class="content">
-              <div class="detail"><span class="label">Statut:</span> ${expense.status}</div>
-              <div class="detail"><span class="label">Raison:</span> ${expense.reason}</div>
-              <div class="detail"><span class="label">Bénéficiaire:</span> ${expense.recipientName}</div>
+              <div class="detail"><span class="label">Statut:</span> ${safe.status}</div>
+              <div class="detail"><span class="label">Raison:</span> ${safe.reason}</div>
+              <div class="detail"><span class="label">Bénéficiaire:</span> ${safe.recipientName}</div>
               <div class="detail"><span class="label">Montant:</span> ${formattedAmount}</div>
-              <div class="detail"><span class="label">Méthode de paiement:</span> ${expense.paymentMethod}</div>
-              <div class="detail"><span class="label">Mis à jour par:</span> ${updatedBy}</div>
+              <div class="detail"><span class="label">Méthode de paiement:</span> ${safe.paymentMethod}</div>
+              <div class="detail"><span class="label">Mis à jour par:</span> ${escapeHtml(updatedBy)}</div>
               <div class="detail"><span class="label">Raison de la mise à jour:</span> ${updateReason || 'Non spécifiée'}</div>
               <div class="detail"><span class="label">Date de mise à jour:</span> ${new Date().toLocaleString('fr-FR')}</div>
               
@@ -323,6 +344,7 @@ async function sendExpenseUpdateNotification(expense, updatedBy, updateReason) {
 }
 
 async function sendExpenseDeletionNotification(expenseInfo, deletedBy) {
+  const safe = htmlSafeRecord(expenseInfo);
   try {
     const adminEmails = process.env.ADMIN_EMAILS ? 
       process.env.ADMIN_EMAILS.split(',') : 
@@ -356,18 +378,18 @@ async function sendExpenseDeletionNotification(expenseInfo, deletedBy) {
           <div class="container">
             <div class="header">
               <h2>Suppression de Dépense</h2>
-              <p>Dépense ID: ${expenseInfo.expenseId}</p>
+              <p>Dépense ID: ${safe.expenseId}</p>
             </div>
             <div class="content">
               <div class="alert">
                 <strong>⚠️ ALERTE:</strong> Cette dépense a été supprimée définitivement du système.
               </div>
               
-              <div class="detail"><span class="label">Ancien statut:</span> ${expenseInfo.status}</div>
-              <div class="detail"><span class="label">Raison:</span> ${expenseInfo.reason}</div>
-              <div class="detail"><span class="label">Bénéficiaire:</span> ${expenseInfo.recipientName}</div>
+              <div class="detail"><span class="label">Ancien statut:</span> ${safe.status}</div>
+              <div class="detail"><span class="label">Raison:</span> ${safe.reason}</div>
+              <div class="detail"><span class="label">Bénéficiaire:</span> ${safe.recipientName}</div>
               <div class="detail"><span class="label">Montant:</span> ${formattedAmount}</div>
-              <div class="detail"><span class="label">Supprimé par:</span> ${deletedBy}</div>
+              <div class="detail"><span class="label">Supprimé par:</span> ${escapeHtml(deletedBy)}</div>
               <div class="detail"><span class="label">Date de suppression:</span> ${new Date().toLocaleString('fr-FR')}</div>
               
               <p><strong>Note:</strong> Cette action est permanente et ne peut pas être annulée.</p>
@@ -401,8 +423,9 @@ function normalizePaymentMethod(pm) {
 }
 
 // Helper function to sanitize input
-function sanitizeInput(input) {
-  return String(input || "").trim();
+function sanitizeInput(input, maxLength = 1000) {
+  if (input !== null && typeof input === "object") return "";
+  return String(input || "").trim().slice(0, maxLength);
 }
 
 // Helper to check if user is admin
@@ -553,18 +576,20 @@ router.get("/", authMiddleware, async (req, res) => {
       filter.paymentMethod = paymentMethod;
     }
     
-    // 4. Apply recordedBy filter if provided
-    if (recordedBy) {
-      filter.recordedBy = { $regex: recordedBy, $options: "i" };
+    // 4. Apply recordedBy filter if provided (literal match)
+    const recordedByRegex = literalSearchRegex(recordedBy);
+    if (recordedByRegex) {
+      filter.recordedBy = recordedByRegex;
     }
-    
-    // 5. Apply search filter if provided
-    if (search) {
+
+    // 5. Apply search filter if provided (literal match, bounded length)
+    const searchRegex = literalSearchRegex(search);
+    if (searchRegex) {
       filter.$or = [
-        { reason: { $regex: search, $options: "i" } },
-        { recipientName: { $regex: search, $options: "i" } },
-        { expenseId: { $regex: search, $options: "i" } },
-        { recipientPhone: { $regex: search, $options: "i" } }
+        { reason: searchRegex },
+        { recipientName: searchRegex },
+        { expenseId: searchRegex },
+        { recipientPhone: searchRegex }
       ];
     }
 
@@ -759,7 +784,8 @@ router.post("/", authMiddleware, async (req, res) => {
     const sanitizedRecipientName = sanitizeInput(recipientName);
     const sanitizedRecipientPhone = sanitizeInput(recipientPhone || (isRepayment ? "N/A" : "")).replace(/\s+/g, "");
     const sanitizedNotes = sanitizeInput(notes);
-    const sanitizedRecordedBy = sanitizeInput(recordedBy || req.user?.id || "Unknown");
+    // Attribution always comes from the authenticated session.
+    const sanitizedRecordedBy = sanitizeInput(req.user?.username || req.user?.id || "Unknown");
 
     const normalizedPM = normalizePaymentMethod(paymentMethod);
 
@@ -1035,13 +1061,14 @@ router.patch("/:id/validate", authMiddleware, async (req, res) => {
           await applyAccountingValidation(current, session);
         }
         current.status = "validated";
-        current.validatedBy = validatedBy || req.user?.username || String(actorId);
+        current.validatedBy = req.user?.username || String(actorId);
         current.validatedAt = now;
         current.notes = updatedNotes;
         updatedExpense = await current.save({ session });
       });
     } finally { await session.endSession(); }
 
+    await recordAudit({ req, action: "EXPENSE_VALIDATED", targetType: "Expense", targetId: req.params.id, after: { status: updatedExpense?.status }, details: { expenseId: updatedExpense?.expenseId, amountUSD: updatedExpense?.amountUSD ?? updatedExpense?.amount } });
     res.json(updatedExpense);
   } catch (error) {
     console.error("Error validating expense:", error);
@@ -1098,6 +1125,7 @@ router.patch("/:id/reject", authMiddleware, async (req, res) => {
       return res.status(409).json({ error: "Expense status changed; refresh and retry" });
     }
 
+    await recordAudit({ req, action: "EXPENSE_REJECTED", targetType: "Expense", targetId: req.params.id, after: { status: updatedExpense.status }, details: { expenseId: updatedExpense.expenseId } });
     res.json(updatedExpense);
   } catch (error) {
     console.error("Error rejecting expense:", error);
@@ -1164,8 +1192,8 @@ router.put("/:id", authMiddleware, async (req, res) => {
     }
 
     // Check if the current user is the one who recorded it (for pending expenses)
-    if (existingExpense.status === "pending" && 
-        existingExpense.recordedBy !== req.user?.id && 
+    if (existingExpense.status === "pending" &&
+        !isExpenseOwner(existingExpense, req.user) &&
         !isAdminUser(req.user)) {
       return res.status(403).json({ 
         error: "You can only edit your own pending expenses" 
@@ -1284,6 +1312,7 @@ router.delete("/:id/admin", authMiddleware, async (req, res) => {
     };
 
     const deleted = await Expense.findOneAndDelete({ _id: req.params.id, status: expense.status });
+    if (deleted) await recordAudit({ req, action: "EXPENSE_DELETED", targetType: "Expense", targetId: req.params.id, before: deleted, details: { route: "admin" } });
     if (!deleted) return res.status(409).json({ error: "Expense status changed; refresh and retry" });
 
     // Send deletion notification
@@ -1319,7 +1348,7 @@ router.delete("/:id", authMiddleware, async (req, res) => {
     }
 
     // Check if the current user is the one who recorded it
-    if (expense.recordedBy !== req.user?.id && !isAdminUser(req.user)) {
+    if (!isExpenseOwner(expense, req.user) && !isAdminUser(req.user)) {
       return res.status(403).json({ 
         error: "You can only delete your own pending expenses" 
       });
@@ -1327,6 +1356,7 @@ router.delete("/:id", authMiddleware, async (req, res) => {
 
     const deleted = await Expense.findOneAndDelete({ _id: req.params.id, status: "pending" });
     if (!deleted) return res.status(409).json({ error: "Expense status changed; refresh and retry" });
+    await recordAudit({ req, action: "EXPENSE_DELETED", targetType: "Expense", targetId: req.params.id, before: deleted, details: { route: "pending" } });
     res.json({ 
       message: "Expense deleted successfully",
       deletedExpense: {
@@ -1526,10 +1556,13 @@ router.get("/recipient/:phone", authMiddleware, async (req, res) => {
     }
 
     // Add recipient filter
-    timeframeFilter.recipientPhone = { $regex: phone, $options: "i" };
+    const phoneRegex = literalSearchRegex(phone, 30);
+    if (!phoneRegex) return res.status(400).json({ error: "Invalid phone" });
+    timeframeFilter.recipientPhone = phoneRegex;
 
     const expenses = await Expense.find(timeframeFilter)
       .sort({ createdAt: -1 })
+      .limit(MAX_UNPAGED_ROWS)
       .lean();
 
     // Calculate totals
@@ -1593,6 +1626,7 @@ router.get("/status/:status", authMiddleware, async (req, res) => {
 
     const expenses = await Expense.find(timeframeFilter)
       .sort({ createdAt: -1 })
+      .limit(MAX_UNPAGED_ROWS)
       .lean();
 
     const totalAmount = expenses.reduce((sum, expense) => sum + expense.amount, 0);
@@ -1615,7 +1649,7 @@ router.get("/status/:status", authMiddleware, async (req, res) => {
 });
 
 /** ---------- TEST EMAIL ENDPOINT ---------- **/
-router.get("/test/email", authMiddleware, async (req, res) => {
+router.get("/test/email", authMiddleware, requireRole("superadmin"), async (req, res) => {
   try {
     // Create a test expense object
     const testExpense = {
@@ -1640,13 +1674,13 @@ router.get("/test/email", authMiddleware, async (req, res) => {
     console.error("Test email error:", error);
     res.status(500).json({ 
       success: false,
-      error: error.message 
+      error: "Email test failed" 
     });
   }
 });
 
 /** ---------- TEST UPDATE EMAIL ENDPOINT ---------- **/
-router.get("/test/email-update", authMiddleware, async (req, res) => {
+router.get("/test/email-update", authMiddleware, requireRole("superadmin"), async (req, res) => {
   try {
     // Create a test expense object
     const testExpense = {
@@ -1673,13 +1707,13 @@ router.get("/test/email-update", authMiddleware, async (req, res) => {
     console.error("Test update email error:", error);
     res.status(500).json({ 
       success: false,
-      error: error.message 
+      error: "Email test failed" 
     });
   }
 });
 
 /** ---------- TEST DELETE EMAIL ENDPOINT ---------- **/
-router.get("/test/email-delete", authMiddleware, async (req, res) => {
+router.get("/test/email-delete", authMiddleware, requireRole("superadmin"), async (req, res) => {
   try {
     // Create a test expense info object
     const testExpenseInfo = {
@@ -1700,7 +1734,7 @@ router.get("/test/email-delete", authMiddleware, async (req, res) => {
     console.error("Test delete email error:", error);
     res.status(500).json({ 
       success: false,
-      error: error.message 
+      error: "Email test failed" 
     });
   }
 });

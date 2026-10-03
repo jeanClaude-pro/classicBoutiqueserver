@@ -18,6 +18,15 @@ const {
 } = require("../utils/salePricing");
 const { getFallbackExchangeRate } = require("../utils/currentExchangeRate");
 const { recordProductEditMovements, recordStockMovement } = require("../services/stockMovementService");
+const { validateObjectIdParam } = require("../middleware/security");
+const { requireModuleAccess } = require("../middleware/moduleAccess");
+const { recordAudit } = require("../services/auditLog");
+const { boundedString } = require("../utils/validation");
+
+router.param("id", validateObjectIdParam("product ID"));
+// The catalogue is read by the Products module, the POS and sale corrections.
+const canReadProducts = requireModuleAccess("/products", "/", "/sales");
+const PRODUCT_STATUSES = new Set(["active", "inactive"]);
 
 const canViewAcquisitionCosts = (user) => ["admin", "superadmin"].includes(user?.role);
 const acquisitionCostProjection = {
@@ -156,10 +165,11 @@ async function financialProductFields(body, existing = null) {
 }
 
 // GET /api/products - Get all products with optional filtering
-router.get("/", authMiddleware, async (req, res) => {
-  console.log("Fetching products with filters:", req.query);
+router.get("/", authMiddleware, canReadProducts, async (req, res) => {
   try {
-    const { search, category, status } = req.query;
+    const search = boundedString(req.query.search, 100);
+    const category = boundedString(req.query.category, 100);
+    const status = boundedString(req.query.status, 20);
 
     // Build filter object
     const filter = {};
@@ -169,7 +179,7 @@ router.get("/", authMiddleware, async (req, res) => {
     }
 
     if (category) {
-      filter.$or = [{ category }, { subcategory: category }, { mainCategory: String(category).toUpperCase() }];
+      filter.$or = [{ category }, { subcategory: category }, { mainCategory: category.toUpperCase() }];
     }
     if (isShareholderAdmin(req.user)) {
       delete filter.$or;
@@ -191,7 +201,7 @@ router.get("/", authMiddleware, async (req, res) => {
 });
 
 // GET /api/products/:id - Get a single product by ID
-router.get("/:id", authMiddleware, async (req, res) => {
+router.get("/:id", authMiddleware, canReadProducts, async (req, res) => {
   try {
     const query = Product.findOne({
       _id: req.params.id,
@@ -245,14 +255,17 @@ router.post("/", authMiddleware, isAdmin, async (req, res) => {
       });
     }
 
+    if (status !== undefined && !PRODUCT_STATUSES.has(status)) {
+      return res.status(400).json({ error: "Invalid status" });
+    }
     const financialFields = await financialProductFields(req.body);
     const product = new Product({
-      name,
-      description: description || "",
+      name: boundedString(name, 200),
+      description: boundedString(description, 2000),
       ...financialFields,
-      brand: brand || "",
+      brand: boundedString(brand, 100),
       minStock: Number(minStock) || 0,
-      unit: unit || "pcs",
+      unit: boundedString(unit, 30) || "pcs",
       weight: Number(weight) || 0,
       status: status || "active",
     });
@@ -272,6 +285,7 @@ router.post("/", authMiddleware, isAdmin, async (req, res) => {
       });
       return product;
     });
+    await recordAudit({ req, action: "PRODUCT_CREATED", targetType: "Product", targetId: savedProduct._id, after: { name: savedProduct.name, mainCategory: savedProduct.mainCategory, stock: savedProduct.stock, price: savedProduct.price, unitCost: savedProduct.unitCost } });
     res.status(201).json(savedProduct);
   } catch (error) {
     console.error("Error creating product:", error);
@@ -309,6 +323,9 @@ router.put("/:id", authMiddleware, isAdmin, async (req, res) => {
       unitCost,
     } = req.body;
 
+    if (status !== undefined && !PRODUCT_STATUSES.has(status)) {
+      return res.status(400).json({ error: "Invalid status" });
+    }
     const existingProduct = await Product.findById(req.params.id).lean();
     if (!existingProduct) return res.status(404).json({ error: "Product not found" });
     const financialFields = await financialProductFields(req.body, existingProduct);
@@ -316,12 +333,12 @@ router.put("/:id", authMiddleware, isAdmin, async (req, res) => {
     // Build update object with only provided fields
     const updateData = {};
 
-    if (name !== undefined) updateData.name = name;
-    if (description !== undefined) updateData.description = description;
+    if (name !== undefined) updateData.name = boundedString(name, 200);
+    if (description !== undefined) updateData.description = boundedString(description, 2000);
     Object.assign(updateData, financialFields);
-    if (brand !== undefined) updateData.brand = brand;
+    if (brand !== undefined) updateData.brand = boundedString(brand, 100);
     if (minStock !== undefined) updateData.minStock = Number(minStock);
-    if (unit !== undefined) updateData.unit = unit;
+    if (unit !== undefined) updateData.unit = boundedString(unit, 30) || "pcs";
     if (weight !== undefined) updateData.weight = Number(weight);
     if (status !== undefined) updateData.status = status;
 
@@ -344,6 +361,12 @@ router.put("/:id", authMiddleware, isAdmin, async (req, res) => {
       return res.status(409).json({ error: "Product changed; refresh and retry" });
     }
 
+    const tracked = ["name", "stock", "price", "unitCost", "mainCategory", "status", "minStock"];
+    await recordAudit({
+      req, action: "PRODUCT_UPDATED", targetType: "Product", targetId: updatedProduct._id,
+      before: Object.fromEntries(tracked.map((key) => [key, existingProduct[key]])),
+      after: Object.fromEntries(tracked.map((key) => [key, updatedProduct[key]])),
+    });
     res.json(updatedProduct);
   } catch (error) {
     console.error("Error updating product:", error);
@@ -391,6 +414,7 @@ router.delete("/:id", authMiddleware, isAdmin, async (req, res) => {
       return res.status(404).json({ error: "Product not found" });
     }
 
+    await recordAudit({ req, action: "PRODUCT_DELETED", targetType: "Product", targetId: deletedProduct._id, before: deletedProduct });
     res.json({ message: "Product deleted successfully" });
   } catch (error) {
     console.error("Error deleting product:", error);

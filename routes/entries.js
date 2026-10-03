@@ -10,7 +10,28 @@ const {
   paginationMetadata,
   parsePagination,
 } = require("../utils/queryHelpers");
+const { validateObjectIdParam } = require("../middleware/security");
+const { requireModuleAccess } = require("../middleware/moduleAccess");
+const { recordAudit } = require("../services/auditLog");
+const { boundedString, literalSearchRegex } = require("../utils/validation");
 const BUSINESS_UTC_OFFSET_MS = 2 * 60 * 60 * 1000;
+// Endpoints without pagination never return more than this many rows.
+const MAX_UNPAGED_ROWS = 1000;
+
+// Every entry endpoint belongs to the Entries modules (record or history).
+router.use(authMiddleware, requireModuleAccess("/entry", "/entryhistory"));
+router.param("id", validateObjectIdParam("entry ID"));
+
+// Payer details are stored as bounded strings only.
+function cleanReceivedFrom(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return {
+    name: boundedString(value.name, 120),
+    phone: boundedString(value.phone, 30),
+    email: boundedString(value.email, 254).toLowerCase(),
+  };
+}
+const requiredText = (value, maxLength) => typeof value === "string" && value.trim() && value.trim().length <= maxLength;
 const visibleTimeframeQuery = (req) => ["admin", "superadmin"].includes(req.user?.role) ? req.query : {};
 
 // ==================== TIME FRAME HELPER FUNCTIONS ====================
@@ -233,16 +254,20 @@ router.get("/", authMiddleware, async (req, res) => {
     
     // 5. Apply createdBy filter if provided
     if (createdBy) {
+      if (typeof createdBy !== "string" || !mongoose.isObjectIdOrHexString(createdBy)) {
+        return res.status(400).json({ error: "Invalid createdBy" });
+      }
       filter.createdBy = createdBy;
     }
-    
-    // 6. Apply search filter if provided
-    if (search) {
+
+    // 6. Apply search filter if provided (literal match, bounded length)
+    const searchRegex = literalSearchRegex(search);
+    if (searchRegex) {
       filter.$or = [
-        { entryId: { $regex: search, $options: "i" } },
-        { source: { $regex: search, $options: "i" } },
-        { category: { $regex: search, $options: "i" } },
-        { description: { $regex: search, $options: "i" } }
+        { entryId: searchRegex },
+        { source: searchRegex },
+        { category: searchRegex },
+        { description: searchRegex }
       ];
     }
 
@@ -395,14 +420,14 @@ router.post("/", authMiddleware, async (req, res) => {
         error: "Amount is required and must be positive" 
       });
     }
-    if (!source) {
-      return res.status(400).json({ 
-        error: "Source is required" 
+    if (!requiredText(source, 100)) {
+      return res.status(400).json({
+        error: "Source is required"
       });
     }
-    if (!category) {
-      return res.status(400).json({ 
-        error: "Category is required" 
+    if (!requiredText(category, 100)) {
+      return res.status(400).json({
+        error: "Category is required"
       });
     }
 
@@ -429,8 +454,8 @@ router.post("/", authMiddleware, async (req, res) => {
       source: source.trim(),
       paymentMethod: normalizedPM,
       category: category.trim(),
-      description: description ? description.trim() : "",
-      receivedFrom: receivedFrom || {},
+      description: boundedString(description, 1000),
+      receivedFrom: cleanReceivedFrom(receivedFrom),
       createdBy: req.user.userId
     };
 
@@ -502,17 +527,17 @@ router.put("/:id", authMiddleware, async (req, res) => {
         error: "Amount is required and must be positive" 
       });
     }
-    if (!source) {
-      return res.status(400).json({ 
-        error: "Source is required" 
+    if (!requiredText(source, 100)) {
+      return res.status(400).json({
+        error: "Source is required"
       });
     }
-    if (!category) {
-      return res.status(400).json({ 
-        error: "Category is required" 
+    if (!requiredText(category, 100)) {
+      return res.status(400).json({
+        error: "Category is required"
       });
     }
-    if (!reason || reason.trim() === "") {
+    if (!requiredText(reason, 500)) {
       return res.status(400).json({ 
         error: "Reason for editing is required" 
       });
@@ -608,8 +633,8 @@ router.put("/:id", authMiddleware, async (req, res) => {
         source: source.trim(),
         paymentMethod: normalizedPM,
         category: category.trim(),
-        description: description ? description.trim() : "",
-        receivedFrom: receivedFrom || {},
+        description: boundedString(description, 1000),
+        receivedFrom: cleanReceivedFrom(receivedFrom),
         updatedBy: req.user.userId,
         $push: {
           editHistory: {
@@ -625,6 +650,7 @@ router.put("/:id", authMiddleware, async (req, res) => {
      .populate("updatedBy", "username")
      .populate("editHistory.editedBy", "username");
 
+    await recordAudit({ req, action: "ENTRY_EDITED", targetType: "Entry", targetId: id, details: { entryId: updatedEntry?.entryId, reason: reason.trim(), changes: Object.fromEntries(changes) } });
     res.json({
       message: "Entry updated successfully",
       entry: updatedEntry
@@ -673,9 +699,10 @@ router.delete("/:id", authMiddleware, async (req, res) => {
       { new: true }
     );
 
-    res.json({ 
-      message: "Entry deleted successfully", 
-      entry: deletedEntry 
+    await recordAudit({ req, action: "ENTRY_DELETED", targetType: "Entry", targetId: req.params.id, before: { status: entry.status, amount: entry.amount, entryId: entry.entryId }, after: { status: "deleted" } });
+    res.json({
+      message: "Entry deleted successfully",
+      entry: deletedEntry
     });
   } catch (error) {
     console.error("Error deleting entry:", error);
@@ -719,9 +746,10 @@ router.patch("/:id/restore", authMiddleware, async (req, res) => {
       { new: true }
     );
 
-    res.json({ 
-      message: "Entry restored successfully", 
-      entry: restoredEntry 
+    await recordAudit({ req, action: "ENTRY_RESTORED", targetType: "Entry", targetId: req.params.id, before: { status: "deleted" }, after: { status: "active" } });
+    res.json({
+      message: "Entry restored successfully",
+      entry: restoredEntry
     });
   } catch (error) {
     console.error("Error restoring entry:", error);
@@ -974,12 +1002,14 @@ router.get("/category/:category", authMiddleware, async (req, res) => {
     const entries = await Entry.find(timeframeFilter)
       .populate("createdBy", "username email")
       .sort({ createdAt: -1 })
+      .limit(MAX_UNPAGED_ROWS)
       .lean();
 
     const totalAmount = entries.reduce((sum, entry) => sum + entry.amount, 0);
 
     res.json({
       success: true,
+      truncated: entries.length === MAX_UNPAGED_ROWS,
       category: category,
       timeframe: getTimeframeDescription(req.query),
       summary: {
@@ -1018,12 +1048,14 @@ router.get("/source/:source", authMiddleware, async (req, res) => {
     const entries = await Entry.find(timeframeFilter)
       .populate("createdBy", "username email")
       .sort({ createdAt: -1 })
+      .limit(MAX_UNPAGED_ROWS)
       .lean();
 
     const totalAmount = entries.reduce((sum, entry) => sum + entry.amount, 0);
 
     res.json({
       success: true,
+      truncated: entries.length === MAX_UNPAGED_ROWS,
       source: source,
       timeframe: getTimeframeDescription(req.query),
       summary: {
@@ -1062,12 +1094,14 @@ router.get("/payment/:method", authMiddleware, async (req, res) => {
     const entries = await Entry.find(timeframeFilter)
       .populate("createdBy", "username email")
       .sort({ createdAt: -1 })
+      .limit(MAX_UNPAGED_ROWS)
       .lean();
 
     const totalAmount = entries.reduce((sum, entry) => sum + entry.amount, 0);
 
     res.json({
       success: true,
+      truncated: entries.length === MAX_UNPAGED_ROWS,
       paymentMethod: method,
       timeframe: getTimeframeDescription(req.query),
       summary: {
@@ -1104,12 +1138,14 @@ router.get("/user/me", authMiddleware, async (req, res) => {
     const entries = await Entry.find(timeframeFilter)
       .populate("createdBy", "username email")
       .sort({ createdAt: -1 })
+      .limit(MAX_UNPAGED_ROWS)
       .lean();
 
     const totalAmount = entries.reduce((sum, entry) => sum + entry.amount, 0);
 
     res.json({
       success: true,
+      truncated: entries.length === MAX_UNPAGED_ROWS,
       userId: req.user.userId,
       timeframe: getTimeframeDescription(req.query),
       summary: {
@@ -1148,8 +1184,12 @@ router.get("/permissions/me", authMiddleware, async (req, res) => {
 /** ---------- GET ENTRIES HISTORY/AUDIT LOG ---------- */
 router.get("/:id/history", authMiddleware, async (req, res) => {
   try {
-    const entry = await Entry.findById(req.params.id)
-      .populate("editHistory.editedBy", "username email");
+    // Same visibility as GET /:id: roles without history access only reach
+    // entries of the current business day.
+    const entry = await Entry.findOne({
+      _id: req.params.id,
+      ...(["admin", "superadmin"].includes(req.user?.role) ? {} : buildTimeframeFilter({})),
+    }).populate("editHistory.editedBy", "username email");
 
     if (!entry) {
       return res.status(404).json({ error: "Entry not found" });

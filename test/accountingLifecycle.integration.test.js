@@ -162,7 +162,7 @@ itest("13. a corrected sale uses corrected values once and keeps its historical 
   const sale = (await ctx.sell([{ product: clothes, quantity: 5 }])).body;
   await Product.updateOne({ _id: clothes._id }, { $set: { unitCost: 80 } });
   const edit = await ctx.request("PUT", `/sales/${sale._id}`, {
-    token: ctx.token("staff"),
+    token: ctx.token("manager"),
     body: { isWalkIn: true, items: [{ productId: String(clothes._id), quantity: 3, price: 110 }], paymentMethod: "cash", reason: "wrong quantity" },
   });
   assert.equal(edit.status, 200, JSON.stringify(edit.body));
@@ -499,7 +499,9 @@ itest("27b. non-admin roles cannot reach previous days through the API", async (
     assert.equal(list.body.data.length, 1, `${role} sees today only`);
     assert.equal((await ctx.request("GET", `/sales/${old.body._id}`, { token })).status, 404);
     const put = await ctx.request("PUT", `/sales/${old.body._id}`, { token, body: { isWalkIn: true, items: [{ productId: String(shoes._id), quantity: 1, price: 1 }] } });
-    assert.equal(put.status, 404, `${role} cannot correct an old sale`);
+    // Roles without correction rights are refused before the lookup (403);
+    // a manager reaches the lookup and still cannot see an old sale (404).
+    assert.equal(put.status, role === "manager" ? 404 : 403, `${role} cannot correct an old sale`);
     const daily = await ctx.request("GET", `/sales/stats/daily?date=${PAST}`, { token });
     assert.equal(daily.body.date, TODAY);
     assert.equal(daily.body.totalSales, 1);

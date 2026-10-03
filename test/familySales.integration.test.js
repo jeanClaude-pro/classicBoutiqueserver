@@ -169,7 +169,8 @@ itest("ordinary clients, non-admins, offline flags and tampered payloads cannot 
   assert.equal((await postSale("clothesShareholder", body)).status, 403);
   assert.equal((await postSale("superadmin", { ...body, offline: true })).body.error, "FAMILY_SALE_ONLINE_REQUIRED");
   assert.equal((await postSale("superadmin", { ...body, isWalkIn: true })).body.error, "FAMILY_MEMBER_REQUIRED");
-  assert.equal((await postSale("superadmin", { ...body, type: "reservation" })).body.error, "FAMILY_SALE_TYPE_INVALID");
+  // Reservations can no longer be created at all.
+  assert.equal((await postSale("superadmin", { ...body, type: "reservation" })).body.error, "SALE_TYPE_INVALID");
   // Client prices cannot go under the protected acquisition-cost floor.
   const tooLow = await postSale("superadmin", { ...body, requestKey: "too-low", items: [{ ...body.items[0], price: 9, enteredPrice: 9 }] });
   assert.equal(tooLow.body.error, "PRICE_TOO_LOW");

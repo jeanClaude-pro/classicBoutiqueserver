@@ -4,12 +4,20 @@ const Customer = require("../models/Customer");
 const Sale = require("../models/Sale"); // Make sure to import Sale model
 const authMiddleware = require("../middleware/auth");
 const { validateObjectIdParam } = require("../middleware/security");
+const { requireModuleAccess } = require("../middleware/moduleAccess");
+const { recordAudit } = require("../services/auditLog");
+const { boundedString } = require("../utils/validation");
 
 router.use(authMiddleware);
 router.param("id", validateObjectIdParam("customer ID"));
 
+// The Clients module manages records; the POS and Sales History only look a
+// client up while recording or correcting a sale.
+const canManageCustomers = requireModuleAccess("/customers");
+const canLookUpCustomers = requireModuleAccess("/customers", "/", "/sales");
+
 // GET /api/customers - Get all customers with optional filtering
-router.get("/", async (req, res) => {
+router.get("/", canLookUpCustomers, async (req, res) => {
   try {
     const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
     const limit = Math.min(100, Math.max(1, Number.parseInt(req.query.limit, 10) || 50));
@@ -49,13 +57,14 @@ router.get("/", async (req, res) => {
 
 // POST /api/customers - Create a client record without inventing a sale.
 // Family classification is an operational-administrator action.
-router.post("/", async (req, res) => {
+router.post("/", canManageCustomers, async (req, res) => {
   try {
     if (req.user.role !== "superadmin") return res.status(403).json({ error: "Superadministrator access required" });
-    const name = String(req.body?.name || "").trim();
-    const phone = String(req.body?.phone || "").trim() || undefined;
-    const email = String(req.body?.email || "").trim().toLowerCase();
+    const name = boundedString(req.body?.name, 121);
+    const phone = boundedString(req.body?.phone, 31) || undefined;
+    const email = boundedString(req.body?.email, 255).toLowerCase();
     if (!name || name.length > 120) return res.status(400).json({ error: "Invalid name" });
+    if (phone && phone.length > 30) return res.status(400).json({ error: "Invalid phone" });
     if (email && (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254)) {
       return res.status(400).json({ error: "Invalid email" });
     }
@@ -65,6 +74,7 @@ router.post("/", async (req, res) => {
       name, phone, email, isFamilyMember,
       ...(isFamilyMember ? { familyStatusUpdatedAt: new Date(), familyStatusUpdatedBy: req.user._id } : {}),
     });
+    await recordAudit({ req, action: "CUSTOMER_CREATED", targetType: "Customer", targetId: customer._id, after: { name, phone, email, isFamilyMember } });
     return res.status(201).json(customer);
   } catch (error) {
     if (error?.code === 11000) return res.status(409).json({ error: "A customer with this phone already exists" });
@@ -74,7 +84,7 @@ router.post("/", async (req, res) => {
 });
 
 // GET /api/customers/:id - Get a single customer by ID
-router.get("/:id", async (req, res) => {
+router.get("/:id", canManageCustomers, async (req, res) => {
   try {
     const customer = await Customer.findById(req.params.id);
     
@@ -95,9 +105,11 @@ router.get("/:id", async (req, res) => {
 });
 
 // GET /api/customers/phone/:phone - Get customer by phone number
-router.get("/phone/:phone", async (req, res) => {
+router.get("/phone/:phone", canLookUpCustomers, async (req, res) => {
   try {
-    const customer = await Customer.findOne({ phone: req.params.phone });
+    const phone = boundedString(req.params.phone, 30);
+    if (!phone) return res.status(400).json({ error: "Invalid phone" });
+    const customer = await Customer.findOne({ phone });
     
     if (!customer) {
       return res.status(404).json({ error: "Customer not found" });
@@ -112,7 +124,7 @@ router.get("/phone/:phone", async (req, res) => {
 
 // POST /api/customers/:id/recalculate - Recalculate customer statistics
 // POST /api/customers/:id/recalculate - Recalculate customer statistics
-router.post("/:id/recalculate", async (req, res) => {
+router.post("/:id/recalculate", canManageCustomers, async (req, res) => {
   try {
     if (req.user.role !== "superadmin") return res.status(403).json({ error: "Superadministrator access required" });
     const customerId = req.params.id;
@@ -179,9 +191,9 @@ router.post("/:id/recalculate", async (req, res) => {
 });
 
 // PUT /api/customers/:id - Update a customer
-router.put("/:id", async (req, res) => {
+router.put("/:id", canManageCustomers, async (req, res) => {
   try {
-    const { name, email } = req.body;
+    const { name, email } = req.body || {};
     
     const updateData = {};
     if (name !== undefined) {
@@ -202,11 +214,18 @@ router.put("/:id", async (req, res) => {
       updateData.familyStatusUpdatedBy = req.user._id;
     }
     
+    const before = await Customer.findById(req.params.id).select("name email isFamilyMember").lean();
     const customer = await Customer.findByIdAndUpdate(
       req.params.id,
-      updateData,
+      { $set: updateData },
       { new: true, runValidators: true }
     );
+    if (customer) {
+      await recordAudit({
+        req, action: updateData.isFamilyMember !== undefined ? "CUSTOMER_FAMILY_STATUS_CHANGED" : "CUSTOMER_UPDATED",
+        targetType: "Customer", targetId: customer._id, before, after: updateData,
+      });
+    }
     
     if (!customer) {
       return res.status(404).json({ error: "Customer not found" });
@@ -230,7 +249,7 @@ router.put("/:id", async (req, res) => {
 });
 
 // GET /api/customers/stats/top - Get top customers by spending
-router.get("/stats/top", async (req, res) => {
+router.get("/stats/top", canManageCustomers, async (req, res) => {
   try {
     const limit = Math.min(100, Math.max(1, Number.parseInt(req.query.limit, 10) || 10));
     

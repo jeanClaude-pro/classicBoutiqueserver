@@ -36,6 +36,13 @@ const userSchema = new mongoose.Schema(
       type: [String],
       default: [],
     },
+    // Bumped on role change or deactivation: every token signed with an older
+    // value is refused (see middleware/auth.js).
+    tokenVersion: {
+      type: Number,
+      default: 0,
+      select: false,
+    },
     assignedCategory: {
       type: String,
       enum: ["CLOTHES", "SHOES"],

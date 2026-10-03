@@ -10,6 +10,7 @@ const { ensureAccountingLocks } = require("./services/financialAccountingService
 const { ensureStockBaselines } = require("./services/stockMovementService");
 const { repairReversalIndex } = require("./scripts/migrateExpenseAccounting");
 const { MODULES, blockShareholderMutations, requireAssignedCategory, requireShareholderModule } = require("./middleware/authorization");
+const { requireModuleAccess } = require("./middleware/moduleAccess");
 const { productStockSheet, stockSheet, salesSheet } = require("./routes/operationalReports");
 
 const app = express();
@@ -29,9 +30,14 @@ if (process.env.JWT_SECRET.length < 32) {
 
 // Middleware
 app.disable("x-powered-by");
-app.set("trust proxy", 1);
+// Number of reverse-proxy hops in front of the app, so req.ip (used by login
+// throttling) is the real client address. Render has exactly one: the default.
+// Accepts a hop count or an Express trust-proxy keyword list (e.g. "loopback").
+const trustProxy = String(process.env.TRUST_PROXY ?? "1").trim();
+app.set("trust proxy", /^[0-9]+$/.test(trustProxy) ? Number(trustProxy) : trustProxy);
 app.use(helmet({ crossOriginResourcePolicy: { policy: "same-site" } }));
 app.use(express.json({ limit: "256kb" }));
+app.use(express.urlencoded({ extended: false, limit: "64kb" }));
 app.use((error, _req, res, next) => {
   if (error?.type === "entity.parse.failed") {
     return res.status(400).json({ message: "Invalid JSON request" });
@@ -100,6 +106,12 @@ function getMongoUri() {
 
 const MONGO_URI = getMongoUri();
 
+// API responses carry business and personal data: never cache them.
+app.use("/api", (_req, res, next) => {
+  res.set("Cache-Control", "no-store");
+  next();
+});
+
 const guarded = (modules, categorySensitive = false) => [
   authMiddleware,
   requireShareholderModule(...modules),
@@ -113,15 +125,14 @@ app.get("/api/health", (_req, res) => {
   const connected = mongoose.connection.readyState === 1;
   res.status(connected ? 200 : 503).json({ ok: connected, database: connected ? "connected" : "unavailable" });
 });
-app.get("/api/products/stock-sheet", ...guarded([MODULES.PRODUCTS], true), stockSheet);
-app.get("/api/products/:id/stock-sheet", ...guarded([MODULES.PRODUCTS], true), productStockSheet);
-app.get("/api/analytics/sales-sheet", ...guarded([MODULES.REPORTS], true), salesSheet);
+app.get("/api/products/stock-sheet", ...guarded([MODULES.PRODUCTS], true), requireModuleAccess("/products"), stockSheet);
+app.get("/api/products/:id/stock-sheet", ...guarded([MODULES.PRODUCTS], true), requireModuleAccess("/products"), productStockSheet);
+app.get("/api/analytics/sales-sheet", ...guarded([MODULES.REPORTS], true), requireModuleAccess("/reports"), salesSheet);
 app.use("/api/products", ...guarded([MODULES.PRODUCTS], true), require("./routes/products"));
 app.use("/api/sales", ...guarded([MODULES.SALES_HISTORY], true), require("./routes/sales"));
 app.use("/api/customers", ...guarded([MODULES.CUSTOMERS]), require("./routes/customers"));
 app.use("/api/auth", require("./routes/auth"));
 app.use("/api/users", require("./routes/users"));
-app.use("/api/test", require("./routes/test"));
 app.use("/api/categories", ...guarded([MODULES.PRODUCTS]), require("./routes/categories"));
 app.use('/api/print', ...guarded([MODULES.SALES_HISTORY]), printRoutes);
 app.use("/api/expenses", ...guarded([MODULES.EXPENSES]), require("./routes/expenses"));
@@ -130,6 +141,7 @@ app.use("/api/entries", ...guarded([MODULES.ENTRIES]), require("./routes/entries
 app.use("/api/settings", ...guarded([MODULES.REPORTS, MODULES.SALES_HISTORY]), require("./routes/settings"));
 app.use("/api/analytics", ...guarded([MODULES.REPORTS], true), require("./routes/analytics"));
 app.use("/api/creditors", ...guarded([MODULES.DEBTS]), require("./routes/creditors"));
+app.use("/api/audit-logs", require("./routes/auditLogs"));
 // Default route
 app.get("/", (req, res) => {
   res.send("ERP/POS System Backend is running...");

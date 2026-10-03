@@ -2,6 +2,17 @@ const express = require("express");
 const router = express.Router();
 const ExchangeRate = require("../models/ExchangeRate");
 const authMiddleware = require("../middleware/auth");
+const { validateObjectIdParam } = require("../middleware/security");
+const { recordAudit } = require("../services/auditLog");
+const { boundedString } = require("../utils/validation");
+
+router.param("id", validateObjectIdParam("exchange rate ID"));
+
+// A usable rate is a finite positive number (FC per USD).
+const parseRate = (value) => {
+  const rate = typeof value === "number" ? value : typeof value === "string" ? Number.parseFloat(value) : Number.NaN;
+  return Number.isFinite(rate) && rate > 0 && rate < 1e7 ? rate : null;
+};
 
 // GET current active exchange rate
 router.get("/current", authMiddleware, async (req, res) => {
@@ -36,8 +47,9 @@ router.get("/history", authMiddleware, async (req, res) => {
       });
     }
 
-    const { limit = 50 } = req.query;
-    const history = await ExchangeRate.getRateHistory(parseInt(limit));
+    const requested = Number.parseInt(req.query.limit, 10);
+    const limit = Number.isInteger(requested) && requested > 0 ? Math.min(requested, 100) : 50;
+    const history = await ExchangeRate.getRateHistory(limit);
 
     res.json({
       history,
@@ -59,13 +71,19 @@ router.post("/", authMiddleware, async (req, res) => {
       });
     }
 
-    const { rate, effectiveFrom, notes } = req.body;
+    const { effectiveFrom } = req.body;
+    const rate = parseRate(req.body.rate);
+    const notes = boundedString(req.body.notes, 500);
 
     // Validate required fields
-    if (!rate || rate <= 0) {
-      return res.status(400).json({ 
-        error: "Valid exchange rate is required" 
+    if (!rate) {
+      return res.status(400).json({
+        error: "Valid exchange rate is required"
       });
+    }
+    const effectiveDate = effectiveFrom ? new Date(effectiveFrom) : new Date();
+    if (Number.isNaN(effectiveDate.getTime())) {
+      return res.status(400).json({ error: "Invalid effectiveFrom date" });
     }
 
     // Deactivate all previous rates
@@ -76,13 +94,14 @@ router.post("/", authMiddleware, async (req, res) => {
 
     // Create new active rate
     const newRate = new ExchangeRate({
-      rate: parseFloat(rate),
-      effectiveFrom: effectiveFrom ? new Date(effectiveFrom) : new Date(),
+      rate,
+      effectiveFrom: effectiveDate,
       createdBy: req.user.userId,
-      notes: notes || ""
+      notes
     });
 
     const savedRate = await newRate.save();
+    await recordAudit({ req, action: "EXCHANGE_RATE_CREATED", targetType: "ExchangeRate", targetId: savedRate._id, after: { rate, effectiveFrom: effectiveDate } });
 
     res.status(201).json({
       message: "Exchange rate updated successfully",
@@ -111,7 +130,9 @@ router.put("/:id", authMiddleware, async (req, res) => {
     }
 
     const { id } = req.params;
-    const { rate, notes } = req.body;
+    const { notes } = req.body;
+    const rateProvided = req.body.rate !== undefined && req.body.rate !== null && req.body.rate !== "";
+    const rate = rateProvided ? parseRate(req.body.rate) : null;
 
     const existingRate = await ExchangeRate.findById(id);
     if (!existingRate) {
@@ -119,17 +140,19 @@ router.put("/:id", authMiddleware, async (req, res) => {
     }
 
     // Validate rate if provided
-    if (rate && rate <= 0) {
-      return res.status(400).json({ 
-        error: "Valid exchange rate is required" 
+    if (rateProvided && !rate) {
+      return res.status(400).json({
+        error: "Valid exchange rate is required"
       });
     }
 
+    const previousRate = existingRate.rate;
     // Update rate
-    if (rate) existingRate.rate = parseFloat(rate);
-    if (notes !== undefined) existingRate.notes = notes;
+    if (rate) existingRate.rate = rate;
+    if (notes !== undefined) existingRate.notes = boundedString(notes, 500);
 
     const updatedRate = await existingRate.save();
+    await recordAudit({ req, action: "EXCHANGE_RATE_UPDATED", targetType: "ExchangeRate", targetId: updatedRate._id, before: { rate: previousRate }, after: { rate: updatedRate.rate } });
 
     res.json({
       message: "Exchange rate updated successfully",
@@ -173,6 +196,7 @@ router.patch("/:id/deactivate", authMiddleware, async (req, res) => {
     }
 
     await rate.deactivate();
+    await recordAudit({ req, action: "EXCHANGE_RATE_DEACTIVATED", targetType: "ExchangeRate", targetId: rate._id, details: { rate: rate.rate } });
 
     res.json({
       message: "Exchange rate deactivated successfully",

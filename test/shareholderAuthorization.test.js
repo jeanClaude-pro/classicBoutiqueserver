@@ -86,17 +86,18 @@ test("9. shareholder mutations are denied for every business mutation verb", () 
 
 test("10. admin cannot change their category", () => {
   const source = read("routes/users.js");
-  assert.match(source, /router\.put\("\/:userId\/role"[\s\S]*req\.user\.role !== "superadmin"/);
+  assert.match(source, /router\.put\("\/:userId\/role", async[\s\S]*?if \(!requireSuperAdmin\(req, res\)\) return;/);
 });
 
-test("11. admin cannot change their permissions", () => {
+test("11.admin cannot change their permissions", () => {
   const source = read("routes/users.js");
-  assert.match(source, /router\.put\("\/:userId\/permissions"[\s\S]*req\.user\.role !== "superadmin"/);
+  assert.match(source, /router\.put\("\/:userId\/permissions", async[\s\S]*?if \(!requireSuperAdmin\(req, res\)\) return;/);
 });
 
 test("12. admin cannot promote themselves to superadmin", () => {
   const source = read("routes/users.js");
-  assert.match(source, /router\.put\("\/:userId\/role"[\s\S]*Superadmin role required/);
+  assert.match(source, /function requireSuperAdmin[\s\S]*?Superadmin role required/);
+  assert.match(source, /router\.put\("\/:userId\/role", async[\s\S]*?if \(!requireSuperAdmin\(req, res\)\) return;/);
 });
 
 test("13. admin without category receives no protected financial access", () => {

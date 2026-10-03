@@ -167,7 +167,7 @@ itest("purchase cost and profit are only returned to the superadmin and sharehol
   const clothes = await createProduct({ name: "C", price: 20, unitCost: 10, stock: 10 });
   const shoes = await createProduct({ name: "S", price: 50, unitCost: 30, stock: 10, mainCategory: "SHOES" });
   await sell([[clothes, 1, 20], [shoes, 1, 50]]);
-  const manager = await salesSheet("manager");
+  const manager = await salesSheet("reportsManager");
   assert.equal(manager.status, 200);
   assert.equal(manager.body.financialsVisible, false);
   assert.ok(manager.body.rows.every((row) => row.purchaseCost === undefined && row.profit === undefined));
@@ -200,6 +200,6 @@ itest("the sales sheet lists, per product, each price it was sold at and the pie
   assert.equal(body.summary.unitsSold, 8);
 
   // Without financial access the price and pieces are still shown.
-  const manager = await salesSheet("manager");
+  const manager = await salesSheet("reportsManager");
   assert.deepEqual(manager.body.rows.find((item) => item.product === "Chemise").prices.map((price) => price.quantity), [1, 4]);
 });

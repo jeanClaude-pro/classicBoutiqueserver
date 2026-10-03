@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const ShopSettings = require("../models/ShopSettings");
 const authMiddleware = require("../middleware/auth");
+const { recordAudit } = require("../services/auditLog");
 
 router.use(authMiddleware);
 
@@ -30,17 +31,21 @@ router.put("/receipt", async (req, res) => {
     if (req.user.role !== "superadmin") {
       return res.status(403).json({ message: "Accès refusé. Réservé aux administrateurs." });
     }
-    const { shopName, shopAddress, shopNumber, shopRegistration, receiptFooter } =
-      req.body;
-
+    const fields = { shopName: 120, shopAddress: 300, shopNumber: 60, shopRegistration: 120, receiptFooter: 500 };
     const settings = await getOrCreateSettings();
-    if (shopName !== undefined) settings.shopName = shopName;
-    if (shopAddress !== undefined) settings.shopAddress = shopAddress;
-    if (shopNumber !== undefined) settings.shopNumber = shopNumber;
-    if (shopRegistration !== undefined) settings.shopRegistration = shopRegistration;
-    if (receiptFooter !== undefined) settings.receiptFooter = receiptFooter;
+    const before = {};
+    for (const [field, maxLength] of Object.entries(fields)) {
+      const value = req.body?.[field];
+      if (value === undefined) continue;
+      if (typeof value !== "string" || value.length > maxLength) {
+        return res.status(400).json({ message: `Invalid ${field}` });
+      }
+      before[field] = settings[field];
+      settings[field] = value.trim();
+    }
 
     await settings.save();
+    await recordAudit({ req, action: "SETTINGS_UPDATED", targetType: "ShopSettings", targetId: settings._id, before, after: Object.fromEntries(Object.keys(before).map((field) => [field, settings[field]])) });
     res.json(settings);
   } catch (error) {
     console.error(error);

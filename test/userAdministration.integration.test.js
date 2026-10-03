@@ -30,7 +30,7 @@ itest("a superadmin can still deactivate and reactivate another account", async 
   assert.equal(off.status, 200);
   assert.equal(off.body.user.isActive, false);
   const blocked = await ctx.request("GET", "/sales", { token: other.token });
-  assert.equal(blocked.status, 403, "a deactivated account is refused on its next request");
+  assert.equal(blocked.status, 401, "a deactivated account is refused on its next request");
   const on = await ctx.request("PUT", `/users/${other.user._id}/status`, { token: ctx.token("superadmin") });
   assert.equal(on.body.user.isActive, true);
 });
