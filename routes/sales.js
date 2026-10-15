@@ -176,6 +176,7 @@ function discountSnapshot(product, pricing, cartQuantity, rate, priorItem = null
       unitAcquisitionCost: priorItem?.unitAcquisitionCost ?? product.unitCost,
       cartQuantity,
       skipQuantityRequirement: familySale,
+      acquisitionCostOnlyFloor: familySale,
       ...(enteredInFC ? { actualUnitPriceFC: pricing.priceFC, referenceUnitPriceFC: reference.fc } : {}),
     });
   } catch (error) {
@@ -376,6 +377,65 @@ function assertCollectedPayment(paymentMethod) {
   if (CREDIT_PAYMENT_METHODS.has(String(paymentMethod || "").trim().toLowerCase())) {
     throw new HttpError(400, "Les ventes à crédit ne sont pas prises en charge : une vente doit être encaissée intégralement.");
   }
+}
+
+// Audit view of a sale: what was sold, for how much, to whom and by whom.
+// Cost and profit are deliberately left out (the audit trail is readable by
+// the superadmin only, but it does not need them to reconstruct the till).
+function saleAuditSnapshot(sale) {
+  return {
+    saleId: sale.saleId,
+    receiptNumber: sale.receiptNumber,
+    requestKey: sale.requestKey,
+    type: sale.type,
+    status: sale.status,
+    total: sale.total,
+    totalRevenueFC: sale.totalRevenueFC,
+    exchangeRate: sale.exchangeRate,
+    paymentMethod: sale.paymentMethod,
+    salesPerson: sale.salesPerson,
+    isWalkIn: sale.isWalkIn,
+    isFamilySale: sale.isFamilySale,
+    customer: sale.customer,
+    occurredAt: sale.occurredAt,
+    items: (sale.items || []).map((item) => ({
+      productId: item.productId,
+      name: item.name,
+      mainCategory: item.mainCategory,
+      quantity: item.quantity,
+      unitPrice: item.unitSellingPrice ?? item.price,
+      enteredPrice: item.enteredPrice,
+      enteredCurrency: item.enteredCurrency,
+      lineTotal: item.revenue ?? item.total,
+      discountPerUnit: item.discountPerUnit,
+    })),
+  };
+}
+
+// What the till tried to record, as received. Used when a sale is refused so
+// the attempt stays visible centrally instead of only on one device.
+function attemptedSaleAudit(body = {}) {
+  const items = Array.isArray(body.items) ? body.items.slice(0, MAX_SALE_ITEMS) : [];
+  return {
+    requestKey: saleRequestKey(body),
+    receiptNumber: typeof body.receiptNumber === "string" ? body.receiptNumber.slice(0, 120) : undefined,
+    offline: body.offline === true,
+    occurredAt: typeof body.occurredAt === "string" ? body.occurredAt.slice(0, 40) : undefined,
+    exchangeRate: Number(body.exchangeRate) || undefined,
+    paymentMethod: typeof body.paymentMethod === "string" ? body.paymentMethod.slice(0, 30) : undefined,
+    isWalkIn: Boolean(body.isWalkIn),
+    isFamilySale: body.isFamilySale === true,
+    customer: body.customer && typeof body.customer === "object" ? cleanCustomerInput(body.customer) : undefined,
+    total: Number(body.total) || undefined,
+    items: items.map((item) => ({
+      productId: typeof item?.productId === "string" ? item.productId.slice(0, 40) : undefined,
+      name: boundedString(item?.name, 200),
+      quantity: Number(item?.quantity) || 0,
+      price: Number(item?.price) || 0,
+      enteredPrice: Number(item?.enteredPrice) || undefined,
+      enteredCurrency: item?.enteredCurrency === "FC" || item?.enteredCurrency === "USD" ? item.enteredCurrency : undefined,
+    })),
+  };
 }
 
 function financialSummary(sale) {
@@ -1241,6 +1301,14 @@ router.post("/", authMiddleware, requireModuleAccess("/"), async (req, res) => {
       }
 
       const createdSales = await Sale.create([saleData], { session });
+      // Written in the same transaction: a sale can never exist without its
+      // audit record, and a failed audit write cancels the sale.
+      await recordAudit({
+        req, action: "SALE_RECORDED", targetType: "Sale", targetId: createdSales[0]._id,
+        after: saleAuditSnapshot(createdSales[0]),
+        details: { offline: req.body.offline === true, clientOccurredAt: saleData.occurredAt, stockMovements: enrichedItems.length },
+        session,
+      });
       return createdSales[0];
     });
 
@@ -1267,10 +1335,22 @@ router.post("/", authMiddleware, requireModuleAccess("/"), async (req, res) => {
       // Audit trail of refused discounts; the floor itself is never logged.
       console.warn("Sale discount rejected", { user: req.user?.username, code: error.code, itemIndex: error.itemIndex });
       recordDiscountRejection(req.user, error);
-      await recordAudit({ req, action: "SALE_DISCOUNT_REJECTED", outcome: "failure", targetType: "Sale", details: { code: error.code, itemIndex: error.itemIndex } });
+      await recordAudit({ req, action: "SALE_DISCOUNT_REJECTED", outcome: "failure", targetType: "Sale", details: { code: error.code, itemIndex: error.itemIndex, attempt: attemptedSaleAudit(req.body) } });
       return sendDiscountError(res, error);
     }
     console.error("Error creating sale/expense:", error);
+    // Every refused or failed sale attempt is kept centrally with the cart the
+    // till sent, so a sale refused while syncing from a device is never lost
+    // from view (stock, exchange rate, date checks, server errors...).
+    await recordAudit({
+      req, action: "SALE_REJECTED", outcome: "failure", targetType: "Sale",
+      details: {
+        status: error?.status ?? 500,
+        code: error?.code ?? (error?.name === "ValidationError" ? "VALIDATION" : undefined),
+        reason: error instanceof HttpError ? error.message : (error?.name || "Error"),
+        attempt: attemptedSaleAudit(req.body),
+      },
+    });
     return sendMutationError(res, error, "Failed to create sale/expense");
   }
 });
@@ -1809,15 +1889,17 @@ router.put("/:id", authMiddleware, canUseHistory, canCorrectSales, async (req, r
       if (newCustomerIdString) {
         await recalculateCustomerStats(newCustomerIdString, session);
       }
+      // Same transaction as the correction: no correction without its trail.
+      await recordAudit({
+        req, action: "SALE_CORRECTED", targetType: "Sale", targetId: id,
+        before: { ...saleAuditSnapshot(currentSale), financials: financialSummary(currentSale) },
+        after: { ...saleAuditSnapshot(savedSale), financials: financialSummary(savedSale) },
+        details: { saleId: currentSale.saleId, reason: reason || "Sale correction", stockAdjustments },
+        session,
+      });
       return savedSale;
     });
 
-    await recordAudit({
-      req, action: "SALE_CORRECTED", targetType: "Sale", targetId: id,
-      before: { total: originalSale.total, paymentMethod: originalSale.paymentMethod, customer: originalSale.customer, items: financialSummary(originalSale).items },
-      after: { total: updatedSale.total, paymentMethod: updatedSale.paymentMethod, customer: updatedSale.customer, items: financialSummary(updatedSale).items },
-      details: { saleId: originalSale.saleId, reason: reason || "Sale correction" },
-    });
     res.json(safeSaleResponse(updatedSale, req.user));
   } catch (error) {
     if (error instanceof DiscountValidationError) {
@@ -1996,14 +2078,17 @@ router.patch("/:id/void", authMiddleware, async (req, res) => {
     if (sale.customerId && (sale.type === "sale" || sale.type === "reservation")) {
       await recalculateCustomerStats(sale.customerId, session);
     }
+    // Same transaction as the void: no void without its trail.
+    await recordAudit({
+      req, action: "SALE_VOIDED", targetType: "Sale", targetId: id,
+      before: saleAuditSnapshot(sale),
+      after: { status: "voided" },
+      details: { saleId: updatedSale.saleId, total: updatedSale.total, reason: reason || "Sale voided", items: (updatedSale.items || []).map((item) => ({ productId: item.productId, name: item.name, quantity: item.quantity })) },
+      session,
+    });
     return updatedSale;
     });
 
-    await recordAudit({
-      req, action: "SALE_VOIDED", targetType: "Sale", targetId: id,
-      after: { status: "voided" },
-      details: { saleId: voidedSale.saleId, total: voidedSale.total, reason: reason || "Sale voided", items: (voidedSale.items || []).map((item) => ({ productId: item.productId, name: item.name, quantity: item.quantity })) },
-    });
     res.json(safeSaleResponse(voidedSale, req.user));
   } catch (error) {
     console.error("Error voiding sale:", error);

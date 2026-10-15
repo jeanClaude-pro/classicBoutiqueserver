@@ -5,6 +5,7 @@ const isAdmin = require("../middleware/isAdmin");
 const authMiddleware = require("../middleware/auth");
 
 const Category = require("../models/Category");
+const { recordAudit } = require("../services/auditLog");
 
 router.use(authMiddleware);
 
@@ -17,6 +18,7 @@ router.post("/", isAdmin, async (req, res) => {
       return res.status(400).json({ message: "Invalid category" });
     }
     const newCategories = await Category.create({ name, description });
+    await recordAudit({ req, action: "CATEGORY_CREATED", targetType: "Category", targetId: newCategories._id, after: { name, description } });
     res.status(201).json(newCategories);
   } catch (error) {
     console.error("Error creating category:", error);

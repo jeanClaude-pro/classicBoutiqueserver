@@ -196,6 +196,39 @@ function normalizePaymentMethod(pm) {
   return "other";
 }
 
+function entryAuditSnapshot(entry) {
+  const value = typeof entry?.toObject === "function" ? entry.toObject() : { ...entry };
+  return {
+    entryId: value.entryId,
+    status: value.status,
+    amountUSD: value.amountUSD ?? value.amount,
+    amountFC: value.amountFC,
+    enteredAmount: value.enteredAmount,
+    enteredCurrency: value.enteredCurrency,
+    exchangeRate: value.exchangeRate,
+    source: value.source,
+    category: value.category,
+    paymentMethod: value.paymentMethod,
+    description: value.description,
+    receivedFrom: value.receivedFrom,
+    requestKey: value.requestKey,
+  };
+}
+
+// Same key + same author + same money = the same entry: return it. The same
+// key reused for a different entry is refused instead of silently ignored.
+function replayEntryRequest(res, req, existing) {
+  const sameAuthor = String(existing.createdBy) === String(req.user.userId);
+  const submitted = Number(req.body?.enteredAmount ?? req.body?.amount);
+  const recorded = Number(existing.enteredAmount ?? existing.amount);
+  const sameMoney = Math.round(submitted * 100) === Math.round(recorded * 100) &&
+    (req.body?.enteredCurrency || "USD") === (existing.enteredCurrency || "USD");
+  if (!sameAuthor || !sameMoney) {
+    return res.status(409).json({ error: "IDEMPOTENCY_CONFLICT", message: "Cette clé de requête a déjà été utilisée avec des données différentes." });
+  }
+  return res.status(200).json(existing);
+}
+
 // ==================== MAIN ENTRIES ENDPOINT (TIME FRAME PAGINATION) ====================
 
 /** 
@@ -403,16 +436,25 @@ router.get("/", authMiddleware, async (req, res) => {
 // ==================== ALL OTHER ROUTES ====================
 
 /** ---------- CREATE ENTRY (Everyone can create) ---------- */
-router.post("/", authMiddleware, async (req, res) => {
+// Recording money in is the Entry page's job; the history page only reads.
+router.post("/", authMiddleware, requireModuleAccess("/entry"), async (req, res) => {
+  const requestKey = typeof req.body?.requestKey === "string" ? req.body.requestKey.trim().slice(0, 100) || undefined : undefined;
   try {
-    const { 
-      amount, 
-      source, 
-      paymentMethod, 
-      category, 
+    const {
+      amount,
+      source,
+      paymentMethod,
+      category,
       description,
-      receivedFrom 
+      receivedFrom
     } = req.body;
+
+    // A retry of an entry that was already recorded (lost response, double
+    // submission) returns that entry instead of recording the money twice.
+    if (requestKey) {
+      const existing = await Entry.findOne({ requestKey }).lean();
+      if (existing) return replayEntryRequest(res, req, existing);
+    }
 
     // Validation (like your sale validation)
     if (!amount || amount <= 0) {
@@ -456,14 +498,34 @@ router.post("/", authMiddleware, async (req, res) => {
       category: category.trim(),
       description: boundedString(description, 1000),
       receivedFrom: cleanReceivedFrom(receivedFrom),
+      requestKey,
       createdBy: req.user.userId
     };
 
-    const entry = new Entry(entryData);
-    const savedEntry = await entry.save();
+    // The entry and its audit record are written together: no money in
+    // without a trail, and a failed audit write cancels the entry.
+    const session = await mongoose.startSession();
+    let savedEntry;
+    try {
+      await session.withTransaction(async () => {
+        [savedEntry] = await Entry.create([entryData], { session });
+        await recordAudit({
+          req, action: "ENTRY_CREATED", targetType: "Entry", targetId: savedEntry._id,
+          after: entryAuditSnapshot(savedEntry),
+          session,
+        });
+      });
+    } finally {
+      await session.endSession();
+    }
 
     return res.status(201).json(savedEntry);
   } catch (error) {
+    if (error?.code === 11000 && requestKey) {
+      // A concurrent identical submission committed first: replay it.
+      const existing = await Entry.findOne({ requestKey }).lean();
+      if (existing) return replayEntryRequest(res, req, existing);
+    }
     console.error("Error creating entry:", error);
     if (error.name === "ValidationError") {
       const errors = Object.values(error.errors).map((e) => e.message);

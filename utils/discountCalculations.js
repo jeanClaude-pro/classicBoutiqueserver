@@ -47,10 +47,12 @@ function validateUnitSellingPrice({
   actualUnitPriceFC,
   referenceUnitPriceFC,
   skipQuantityRequirement = false,
+  acquisitionCostOnlyFloor = false,
 }) {
   const actualCents = toCents(actualUnitPrice, "actualUnitPrice");
   const referenceCents = toCents(referenceUnitPrice, "referenceUnitPrice");
   const costCents = toCents(unitAcquisitionCost, "unitAcquisitionCost");
+  const exactCostCents = Number(unitAcquisitionCost) * 100;
   const comparesFC = isAmount(actualUnitPriceFC) && isAmount(referenceUnitPriceFC);
   const discountApplied = comparesFC
     ? Number(actualUnitPriceFC) < Number(referenceUnitPriceFC)
@@ -64,17 +66,21 @@ function validateUnitSellingPrice({
   }
 
   const originalProfitCents = Math.max(0, referenceCents - costCents);
-  const minimumAllowedCents = Math.max(
-    costCents,
-    costCents + Math.ceil(originalProfitCents / 2)
-  );
+  const minimumAllowedCents = acquisitionCostOnlyFloor
+    ? exactCostCents
+    : Math.max(costCents, costCents + Math.ceil(originalProfitCents / 2));
 
   // The protected floor only limits DISCOUNTS. The normal selling price set
   // on the Product is always accepted as is, even when it leaves little or
   // no profit (profit = selling price - acquisition cost, possibly a loss),
   // e.g. an FC price whose USD value fell under a USD-recorded cost after
   // the exchange rate rose.
-  if (discountApplied && Number(actualUnitPrice) * 100 < minimumAllowedCents - FLOOR_EPSILON_CENTS) {
+  // Family sales use acquisitionCostOnlyFloor. In that mode the purchase
+  // cost is an unconditional floor, including the unusual case where the
+  // catalogue price itself is already below cost. Ordinary transactions keep
+  // their historical rule: only a discount is checked against the protected
+  // half-profit floor.
+  if ((discountApplied || acquisitionCostOnlyFloor) && Number(actualUnitPrice) * 100 < minimumAllowedCents - FLOOR_EPSILON_CENTS) {
     throw new DiscountValidationError(
       "PRICE_TOO_LOW",
       "Prix trop bas. Veuillez augmenter le prix."

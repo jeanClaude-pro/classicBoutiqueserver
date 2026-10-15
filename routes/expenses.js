@@ -319,7 +319,7 @@ async function sendExpenseUpdateNotification(expense, updatedBy, updateReason) {
               <div class="detail"><span class="label">Montant:</span> ${formattedAmount}</div>
               <div class="detail"><span class="label">Méthode de paiement:</span> ${safe.paymentMethod}</div>
               <div class="detail"><span class="label">Mis à jour par:</span> ${escapeHtml(updatedBy)}</div>
-              <div class="detail"><span class="label">Raison de la mise à jour:</span> ${updateReason || 'Non spécifiée'}</div>
+              <div class="detail"><span class="label">Raison de la mise à jour:</span> ${escapeHtml(updateReason || 'Non spécifiée')}</div>
               <div class="detail"><span class="label">Date de mise à jour:</span> ${new Date().toLocaleString('fr-FR')}</div>
               
               <div class="warning">
@@ -511,6 +511,35 @@ async function applyAccountingValidation(expense, session) {
     profitUsed: 0,
     availableAfter: after.availablePurchaseFunds,
     calculatedAt: new Date(),
+  };
+}
+
+// Audit view of a cash-out: amount in both currencies, classification,
+// payee, status and the funding snapshot that justified it.
+function expenseAuditSnapshot(expense) {
+  const value = typeof expense?.toObject === "function" ? expense.toObject() : { ...expense };
+  return {
+    expenseId: value.expenseId,
+    expenseType: value.expenseType,
+    category: value.category,
+    status: value.status,
+    transactionKind: value.transactionKind,
+    reason: value.reason,
+    recipientName: value.recipientName,
+    recipientPhone: value.recipientPhone,
+    amountUSD: value.amountUSD ?? value.amount,
+    amountFC: value.amountFC,
+    enteredAmount: value.enteredAmount,
+    enteredCurrency: value.enteredCurrency,
+    exchangeRate: value.exchangeRate,
+    paymentMethod: value.paymentMethod,
+    recordedBy: value.recordedBy,
+    validatedBy: value.validatedBy,
+    creditorId: value.creditorId,
+    reversalOf: value.reversalOf,
+    fundingSource: value.fundingSource,
+    financialSnapshot: value.financialSnapshot,
+    requestKey: value.requestKey,
   };
 }
 
@@ -745,7 +774,9 @@ async function findRequestReplay(requestKey, actorId, expected) {
 }
 
 /** ---------- CREATE EXPENSE ---------- **/
-router.post("/", authMiddleware, async (req, res) => {
+// Recording a cash-out is the Sortie page's job; the history page only reads
+// and validates.
+router.post("/", authMiddleware, requireModuleAccess("/sortie"), async (req, res) => {
   let replayExpectation = null;
   try {
     const { reason, recipientName, recipientPhone, amount, paymentMethod, notes, recordedBy } = req.body;
@@ -867,6 +898,11 @@ router.post("/", authMiddleware, async (req, res) => {
           expenseData.financialSnapshot = draft.financialSnapshot;
         }
         [savedExpense] = await Expense.create([expenseData], { session });
+        await recordAudit({
+          req, action: autoValidate ? "EXPENSE_CREATED_VALIDATED" : "EXPENSE_CREATED", targetType: "Expense", targetId: savedExpense._id,
+          after: expenseAuditSnapshot(savedExpense),
+          session,
+        });
       });
     } finally { await session.endSession(); }
 
@@ -980,6 +1016,13 @@ router.post("/:id/reverse", authMiddleware, async (req, res) => {
         { new: true, session }
       );
       if (!marked) throw Object.assign(new Error("Transaction already reversed"), { status: 409 });
+      await recordAudit({
+        req, action: "EXPENSE_REVERSED", targetType: "Expense", targetId: original._id,
+        before: expenseAuditSnapshot(original),
+        after: expenseAuditSnapshot(reversal),
+        details: { reversalId: reversal.expenseId, reason: reversalReason },
+        session,
+      });
     });
     return res.status(201).json(reversal);
   } catch (error) {
@@ -1065,10 +1108,17 @@ router.patch("/:id/validate", authMiddleware, async (req, res) => {
         current.validatedAt = now;
         current.notes = updatedNotes;
         updatedExpense = await current.save({ session });
+        // Same transaction as the validation: no spending without its trail.
+        await recordAudit({
+          req, action: "EXPENSE_VALIDATED", targetType: "Expense", targetId: req.params.id,
+          before: { status: "pending" },
+          after: expenseAuditSnapshot(updatedExpense),
+          details: { expenseId: updatedExpense.expenseId, amountUSD: updatedExpense.amountUSD ?? updatedExpense.amount },
+          session,
+        });
       });
     } finally { await session.endSession(); }
 
-    await recordAudit({ req, action: "EXPENSE_VALIDATED", targetType: "Expense", targetId: req.params.id, after: { status: updatedExpense?.status }, details: { expenseId: updatedExpense?.expenseId, amountUSD: updatedExpense?.amountUSD ?? updatedExpense?.amount } });
     res.json(updatedExpense);
   } catch (error) {
     console.error("Error validating expense:", error);
@@ -1261,6 +1311,12 @@ router.put("/:id", authMiddleware, async (req, res) => {
     if (!updatedExpense) {
       return res.status(409).json({ error: "Expense status changed; refresh and retry" });
     }
+    await recordAudit({
+      req, action: "EXPENSE_UPDATED", targetType: "Expense", targetId: req.params.id,
+      before: expenseAuditSnapshot(existingExpense),
+      after: expenseAuditSnapshot(updatedExpense),
+      details: { updateReason: sanitizedUpdateReason || undefined },
+    });
 
     // Send update notification
     sendExpenseUpdateNotification(updatedExpense, req.user?.id || "Unknown", sanitizedUpdateReason);

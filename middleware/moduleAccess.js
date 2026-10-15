@@ -22,11 +22,12 @@ const MODULE_ROLES = Object.freeze({
   "/reports": ["superadmin", "admin"],
   "/customers": ["superadmin", "manager", "cashier_supervisor"],
   "/admin": ["superadmin"],
+  "/audit": ["superadmin"],
 });
 
 /** Module paths a superadmin may grant in the permission editor. */
-const GRANTABLE_MODULES = new Set(Object.keys(MODULE_ROLES).filter((path) => path !== "/admin"));
-const FIXED_ROLE_MODULES = new Set(["/admin"]);
+const FIXED_ROLE_MODULES = new Set(["/admin", "/audit"]);
+const GRANTABLE_MODULES = new Set(Object.keys(MODULE_ROLES).filter((path) => !FIXED_ROLE_MODULES.has(path)));
 
 function hasModuleAccess(user, modulePath) {
   const roles = MODULE_ROLES[modulePath];

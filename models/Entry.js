@@ -56,6 +56,9 @@ const entrySchema = new mongoose.Schema({
       default: ""
     }
   },
+  // Client-generated key: a create request retried after a dropped
+  // connection returns the original entry instead of recording it twice.
+  requestKey: { type: String, trim: true, maxlength: 100, default: undefined },
   // Status and audit (following your Sale pattern)
   status: {
     type: String,
@@ -112,5 +115,10 @@ entrySchema.index({ source: 1 });
 entrySchema.index({ status: 1, createdAt: -1 });
 entrySchema.index({ paymentMethod: 1, createdAt: -1 });
 entrySchema.index({ category: 1, createdAt: -1 });
+// Only real keys are unique; entries saved before this field existed have none.
+entrySchema.index(
+  { requestKey: 1 },
+  { name: "requestKey_unique_when_set", unique: true, partialFilterExpression: { requestKey: { $type: "string" } } }
+);
 
 module.exports = mongoose.model("Entry", entrySchema);

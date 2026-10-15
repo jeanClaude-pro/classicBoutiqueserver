@@ -37,6 +37,29 @@ test("the exact 50% profit boundary is allowed and one cent below is rejected", 
   );
 });
 
+test("a family price may use the full margin but never go below acquisition cost", () => {
+  const familyPrice = (actualUnitPrice, referenceUnitPrice = 20, unitAcquisitionCost = 10) =>
+    validateUnitSellingPrice({
+      actualUnitPrice,
+      referenceUnitPrice,
+      unitAcquisitionCost,
+      cartQuantity: 1,
+      skipQuantityRequirement: true,
+      acquisitionCostOnlyFloor: true,
+    });
+
+  assert.equal(familyPrice(10).discountApplied, true, "the exact acquisition cost is allowed");
+  assert.equal(familyPrice(10.01).discountApplied, true, "no part of the normal margin must be retained");
+  assert.throws(() => familyPrice(9.99), (error) => error.code === "PRICE_TOO_LOW");
+  assert.equal(familyPrice(10000 / 2850, 20000 / 2850, 10000 / 2850).discountApplied, true, "an exact sub-cent converted cost is allowed");
+  assert.throws(() => familyPrice(9999 / 2850, 20000 / 2850, 10000 / 2850), (error) => error.code === "PRICE_TOO_LOW");
+  assert.throws(
+    () => familyPrice(9, 9, 10),
+    (error) => error.code === "PRICE_TOO_LOW",
+    "family sales cannot use a below-cost catalogue price",
+  );
+});
+
 test("a selling price below acquisition cost is rejected without exposing the floor", () => {
   assert.throws(
     () => validate(9, 20, 10),

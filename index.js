@@ -134,7 +134,8 @@ app.use("/api/customers", ...guarded([MODULES.CUSTOMERS]), require("./routes/cus
 app.use("/api/auth", require("./routes/auth"));
 app.use("/api/users", require("./routes/users"));
 app.use("/api/categories", ...guarded([MODULES.PRODUCTS]), require("./routes/categories"));
-app.use('/api/print', ...guarded([MODULES.SALES_HISTORY]), printRoutes);
+// Printing a receipt belongs to the POS and Sales History pages only.
+app.use('/api/print', ...guarded([MODULES.SALES_HISTORY]), requireModuleAccess("/", "/sales"), printRoutes);
 app.use("/api/expenses", ...guarded([MODULES.EXPENSES]), require("./routes/expenses"));
 app.use("/api/exchange-rates", ...guarded([MODULES.EXCHANGE_RATES]), require("./routes/exchangeRates"));
 app.use("/api/entries", ...guarded([MODULES.ENTRIES]), require("./routes/entries"));

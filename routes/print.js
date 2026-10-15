@@ -3,6 +3,7 @@ const escpos = require('escpos');
 escpos.USB = require('escpos-usb');
 const router = express.Router();
 const authMiddleware = require('../middleware/auth');
+const { recordAudit } = require('../services/auditLog');
 const {
   amountRow,
   itemTableRows,
@@ -25,6 +26,27 @@ function receiptContent(receiptData) {
   return { width, labels, lines, totalFC, payment };
 }
 
+// A print request must carry a receipt object with an item list; anything
+// else is refused before the printer is touched.
+function invalidReceipt(receiptData) {
+  return !receiptData || typeof receiptData !== 'object' || Array.isArray(receiptData) ||
+    !Array.isArray(receiptData.items) || receiptData.items.length > 200;
+}
+
+// Every printed receipt or stub (first print and reprints) leaves a trace.
+function auditPrint(req, kind, receiptData, outcome = 'success') {
+  return recordAudit({
+    req, action: kind === 'stub' ? 'STUB_PRINTED' : 'RECEIPT_PRINTED', outcome, targetType: 'Sale',
+    targetId: typeof receiptData?.receiptNumber === 'string' ? receiptData.receiptNumber.slice(0, 120) : undefined,
+    details: {
+      receiptNumber: String(receiptData?.receiptNumber ?? '').slice(0, 120),
+      customerName: String(receiptData?.customerName ?? '').slice(0, 120),
+      itemCount: Array.isArray(receiptData?.items) ? receiptData.items.length : 0,
+      salesPerson: String(receiptData?.salesPerson ?? '').slice(0, 120),
+    },
+  });
+}
+
 // Find and use the first available USB printer
 //printer
 function getPrinter() {
@@ -40,7 +62,8 @@ function getPrinter() {
 // Print receipt endpoint
 router.post('/receipt', async (req, res) => {
   try {
-    const { receiptData, type = 'sale' } = req.body;
+    const { receiptData, type = 'sale' } = req.body || {};
+    if (invalidReceipt(receiptData)) return res.status(400).json({ error: 'Invalid receipt data' });
     
     const printer = getPrinter();
     if (!printer) {
@@ -130,6 +153,7 @@ router.post('/receipt', async (req, res) => {
           });
         });
 
+        await auditPrint(req, 'receipt', receiptData);
         res.json({ success: true, message: 'Receipt printed successfully' });
       } catch (printError) {
         console.error('Print error:', printError);
@@ -145,7 +169,8 @@ router.post('/receipt', async (req, res) => {
 // Print stub endpoint
 router.post('/stub', async (req, res) => {
   try {
-    const { receiptData, type = 'sale' } = req.body;
+    const { receiptData, type = 'sale' } = req.body || {};
+    if (invalidReceipt(receiptData)) return res.status(400).json({ error: 'Invalid receipt data' });
     
     const printer = getPrinter();
     if (!printer) {
@@ -219,6 +244,7 @@ router.post('/stub', async (req, res) => {
           });
         });
 
+        await auditPrint(req, 'stub', receiptData);
         res.json({ success: true, message: 'Stub printed successfully' });
       } catch (printError) {
         console.error('Print error:', printError);

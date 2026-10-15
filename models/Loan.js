@@ -10,8 +10,15 @@ const loanSchema = new mongoose.Schema({
   borrowedAt: { type: Date, required: true, default: Date.now, index: true },
   reference: { type: String, trim: true, default: "" },
   note: { type: String, trim: true, default: "" },
-  createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true }
+  createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+  // Client-generated key: a retried request returns the original loan
+  // instead of adding the same debt twice.
+  requestKey: { type: String, trim: true, maxlength: 100, default: undefined }
 }, { timestamps: true });
 
 loanSchema.index({ creditorId: 1, borrowedAt: -1 });
+loanSchema.index(
+  { requestKey: 1 },
+  { name: "requestKey_unique_when_set", unique: true, partialFilterExpression: { requestKey: { $type: "string" } } }
+);
 module.exports = mongoose.model("Loan", loanSchema);

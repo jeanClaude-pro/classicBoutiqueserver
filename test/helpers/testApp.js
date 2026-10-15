@@ -37,6 +37,7 @@ function createApp() {
   app.use("/api/audit-logs", require("../../routes/auditLogs"));
   app.use("/api/settings", ...guarded([MODULES.REPORTS, MODULES.SALES_HISTORY]), require("../../routes/settings"));
   app.use("/api/exchange-rates", ...guarded([MODULES.EXCHANGE_RATES]), require("../../routes/exchangeRates"));
+  app.use("/api/creditors", ...guarded([MODULES.DEBTS]), require("../../routes/creditors"));
   return app;
 }
 

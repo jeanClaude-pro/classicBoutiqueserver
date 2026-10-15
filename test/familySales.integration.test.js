@@ -82,11 +82,15 @@ itest("the family search returns registered family members only", async () => {
 
 // ------------------------------------------------------------------ family sale
 
-itest("a registered family member may receive a one-item discount with authoritative accounting", async () => {
+itest("a registered family member may receive a one-item discount down to acquisition cost with authoritative accounting", async () => {
   const customer = await Customer.create({ name: "Famille", phone: "0991000002", isFamilyMember: true });
   const product = await ctx.product("CLOTHES", 10, 20, 10);
   // The client-side customer snapshot is ignored: the server copies the record.
-  const body = await familyBody(product, customer, { customer: { name: "Forged name", phone: "000" }, familyMemberName: "Forged" });
+  const body = await familyBody(product, customer, {
+    customer: { name: "Forged name", phone: "000" },
+    familyMemberName: "Forged",
+    items: [{ productId: String(product._id), quantity: 1, price: 10, enteredPrice: 10, enteredCurrency: "USD", exchangeRate: 2850 }],
+  });
   const response = await postSale("superadmin", body);
   assert.equal(response.status, 201, JSON.stringify(response.body));
   const sale = await Sale.findById(response.body._id).lean();
@@ -99,13 +103,13 @@ itest("a registered family member may receive a one-item discount with authorita
   assert.ok(sale.familyAuthorizedAt instanceof Date);
   assert.deepEqual(
     [sale.items[0].referenceUnitSellingPrice, sale.items[0].discountApplied, sale.items[0].discountPerUnit, sale.items[0].priceUSD],
-    [20, true, 5, 15],
+    [20, true, 10, 10],
   );
   assert.equal(sale.exchangeRate, 2850);
-  assert.deepEqual([sale.total, sale.costOfGoodsSold, sale.grossProfit, sale.clothesShareholderProfit], [15, 10, 5, 5]);
+  assert.deepEqual([sale.total, sale.costOfGoodsSold, sale.grossProfit, sale.clothesShareholderProfit], [10, 10, 0, 0]);
   assert.equal((await Product.findById(product._id)).stock, 9);
   const updatedCustomer = await Customer.findById(customer._id).lean();
-  assert.deepEqual([updatedCustomer.totalPurchases, updatedCustomer.totalSpent], [1, 15]);
+  assert.deepEqual([updatedCustomer.totalPurchases, updatedCustomer.totalSpent], [1, 10]);
   const movement = await StockMovement.findOne({ productId: product._id, kind: "SALE" }).lean();
   assert.deepEqual([movement.quantityDelta, movement.balanceBefore, movement.balanceAfter, movement.mainCategory], [-1, 10, 9, "CLOTHES"]);
 });
@@ -172,11 +176,13 @@ itest("ordinary clients, non-admins, offline flags and tampered payloads cannot 
   // Reservations can no longer be created at all.
   assert.equal((await postSale("superadmin", { ...body, type: "reservation" })).body.error, "SALE_TYPE_INVALID");
   // Client prices cannot go under the protected acquisition-cost floor.
-  const tooLow = await postSale("superadmin", { ...body, requestKey: "too-low", items: [{ ...body.items[0], price: 9, enteredPrice: 9 }] });
+  const atCost = await postSale("superadmin", { ...body, requestKey: "at-cost", items: [{ ...body.items[0], price: 10, enteredPrice: 10 }] });
+  assert.equal(atCost.status, 201, JSON.stringify(atCost.body));
+  const tooLow = await postSale("superadmin", { ...body, requestKey: "too-low", items: [{ ...body.items[0], price: 9.99, enteredPrice: 9.99 }] });
   assert.equal(tooLow.body.error, "PRICE_TOO_LOW");
 
-  assert.equal(await Sale.countDocuments({}), 0);
-  assert.equal((await Product.findById(product._id)).stock, 20);
+  assert.equal(await Sale.countDocuments({}), 1);
+  assert.equal((await Product.findById(product._id)).stock, 19);
 });
 
 itest("a member whose family status was revoked is refused at checkout", async () => {

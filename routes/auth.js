@@ -103,11 +103,15 @@ router.post("/login", loginThrottleGuard, async (req, res) => {
 
     // Only someone who knows the password learns that the account is inactive.
     if (!user.isActive) {
+      await recordAudit({ req, actor: user, action: "LOGIN_REFUSED_DISABLED", outcome: "failure", targetType: "User", targetId: user._id });
       return res.status(403).json({ code: "ACCOUNT_DISABLED", message: "Votre compte est désactivé ou en attente d'activation. Contactez un administrateur." });
     }
 
     await recordLoginSuccess(req, email);
     const token = generateToken(user);
+    // Who opened a session, when and from where: needed to attribute every
+    // later transaction on a shared till.
+    await recordAudit({ req, actor: user, action: "LOGIN_SUCCESS", targetType: "User", targetId: user._id });
     console.log("User logged in:", user._id.toString());
     return res.status(200).json({ user: safeUser(user), token });
   } catch (error) {
