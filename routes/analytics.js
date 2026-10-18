@@ -22,6 +22,7 @@ const {
   CATEGORIES,
   buildCategoryReport,
 } = require("../services/financialAccountingService");
+const { buildFinancialTimeSeries } = require("../services/financialTimeSeriesService");
 const { getFallbackExchangeRate } = require("../utils/currentExchangeRate");
 const { productNormalPriceUSDExpression } = require("../utils/salePricing");
 
@@ -319,6 +320,8 @@ router.get("/summary", async (req, res) => {
       assignedCategory: category,
       entitlementRate: category === "CLOTHES" ? 1 : 0.5,
       categoryBreakdown: current.categoryBreakdown,
+      // Already restricted to the assigned category by the Product match.
+      inventoryValuation: current.inventoryValuation,
       topProducts: current.topProducts,
       paymentMethods: current.paymentMethods,
       chartData,
@@ -357,6 +360,24 @@ router.get("/summary", async (req, res) => {
     }
     console.error("Analytics aggregation failed:", error);
     res.status(500).json({ error: "Failed to calculate analytics" });
+  }
+});
+
+// Financial time series for the Reports chart (recognised revenue, COGS,
+// gross profit, company expenses and net result per day/week/month). A
+// shareholder is always pinned to its assigned category.
+router.get("/timeseries", async (req, res) => {
+  try {
+    const category = authorizedCategory(req.user, req.query.category);
+    const result = await buildFinancialTimeSeries({ category, query: req.query });
+    res.set("Cache-Control", "no-store");
+    res.json({ success: true, source: "mongodb-aggregation", paginated: false, ...result });
+  } catch (error) {
+    if (error.status === 400 || /Invalid date|Start date/.test(error.message)) {
+      return res.status(400).json({ error: error.message });
+    }
+    console.error("Analytics time series failed:", error);
+    res.status(500).json({ error: "Failed to calculate the financial time series" });
   }
 });
 
