@@ -25,8 +25,21 @@ test("granularity follows the range length unless requested", () => {
 test("time-series query rejects invalid input", () => {
   assert.throws(() => parseTimeSeriesQuery({ from: "2026-02-01", to: "2026-01-01" }), /before/);
   assert.throws(() => parseTimeSeriesQuery({ from: "2020-01-01", to: "2026-01-01", granularity: "day" }), /too long/);
-  assert.throws(() => parseTimeSeriesQuery({ granularity: "hour" }), /granularity/);
+  assert.throws(() => parseTimeSeriesQuery({ granularity: "minute" }), /granularity/);
+  assert.throws(() => parseTimeSeriesQuery({ from: "2026-10-01", to: "2026-10-08", granularity: "hour" }), /too long/);
   assert.throws(() => parseTimeSeriesQuery({ from: "2026-02-30" }), /Invalid date/);
+});
+
+test("a single day is split into its 24 business hours", () => {
+  const parsed = parseTimeSeriesQuery({ from: "2026-10-19", to: "2026-10-19" });
+  assert.equal(parsed.granularity, "hour");
+  assert.equal(parsed.keys.length, 24);
+  assert.deepEqual([parsed.keys[0], parsed.keys[23]], ["2026-10-19T00", "2026-10-19T23"]);
+  assert.deepEqual(bucketKeys("2026-12-31", "2027-01-01", "hour").slice(23, 25), ["2026-12-31T23", "2027-01-01T00"]);
+  assert.equal(parseTimeSeriesQuery({ from: "2026-10-18", to: "2026-10-19" }).granularity, "day");
+  const sales = JSON.stringify(saleSeriesPipeline(["CLOTHES"], { $gte: new Date(0), $lte: new Date() }, "hour"));
+  assert.match(sales, /%Y-%m-%dT%H/);
+  assert.match(sales, /Africa\/Lubumbashi/);
 });
 
 test("weeks start on Monday and months on the first day", () => {

@@ -73,3 +73,23 @@ itest("time series pins shareholders to their category and validates its query",
   assert.equal((await series({ from: "2020-01-01", to: "2026-01-01", granularity: "day" })).status, 400);
   assert.equal((await series({}, "manager")).status, 403, "Reports is not a manager default");
 });
+
+itest("a single day is bucketed by business hour and still matches the day's accounting", async () => {
+  const clothes = await ctx.product("CLOTHES", 10, 25);
+  const shoes = await ctx.product("SHOES", 20, 50);
+  // Lubumbashi is UTC+2: 22:00Z on the 9th is 00:00 on the 10th, 10:30Z is 12:30.
+  await recordedSale([{ product: clothes, quantity: 2 }], "2026-09-09T22:00:00.000Z");
+  await recordedSale([{ product: clothes, quantity: 1 }, { product: shoes, quantity: 1 }], "2026-09-10T10:30:00.000Z");
+  await recordedSale([{ product: shoes, quantity: 3 }], "2026-09-10T22:00:00.000Z"); // the 11th: outside
+
+  const response = await series({ from: "2026-09-10", to: "2026-09-10" });
+  assert.equal(response.status, 200, JSON.stringify(response.body));
+  const body = response.body;
+  assert.equal(body.granularity, "hour");
+  assert.equal(body.series.length, 24);
+  assert.deepEqual([body.series[0].date, body.series[0].hour, body.series[12].date], ["2026-09-10T00", 0, "2026-09-10T12"]);
+  assert.deepEqual(body.series.filter((row) => row.revenue !== 0).map((row) => [row.hour, row.revenue, row.sales]), [[0, 50, 1], [12, 75, 1]]);
+
+  const day = await series({ from: "2026-09-10", to: "2026-09-10", granularity: "day" });
+  assert.deepEqual(body.totals, day.body.totals, "hours add up to the day exactly");
+});

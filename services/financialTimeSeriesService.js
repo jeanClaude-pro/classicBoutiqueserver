@@ -8,7 +8,7 @@
 // reversals, by validation date. The sum of all buckets therefore equals the
 // PERIOD figures of buildCategoryReport for the same range, to the cent.
 //
-// Buckets are calendar days, ISO weeks (Monday start) or months in the
+// Buckets are hours, calendar days, ISO weeks (Monday start) or months in the
 // business timezone. Empty buckets are returned as real zeros so the chart
 // never interpolates over days without activity.
 const Sale = require("../models/Sale");
@@ -21,8 +21,9 @@ const {
 } = require("./financialAccountingService");
 const { BUSINESS_TIMEZONE, businessDateEnd, businessDateStart } = require("../utils/queryHelpers");
 
-const GRANULARITIES = Object.freeze(["day", "week", "month"]);
-const MAX_BUCKETS = Object.freeze({ day: 400, week: 260, month: 120 });
+const GRANULARITIES = Object.freeze(["hour", "day", "week", "month"]);
+// Hourly buckets cover at most one week (7 x 24).
+const MAX_BUCKETS = Object.freeze({ hour: 168, day: 400, week: 260, month: 120 });
 const DAY_MS = 24 * 60 * 60 * 1000;
 const BUSINESS_UTC_OFFSET_MS = 2 * 60 * 60 * 1000;
 
@@ -36,13 +37,17 @@ function badRequest(message) {
 
 // --------------------------------------------------------------- calendar
 // Bucket keys are plain business-calendar dates ("YYYY-MM-DD", the first day
-// of the bucket). JavaScript only walks those strings as UTC dates, so no
+// of the bucket); an hourly key adds the business hour ("YYYY-MM-DDTHH"). JavaScript only walks those strings as UTC dates, so no
 // local timezone can shift a bucket.
 const isoDate = (date) => date.toISOString().slice(0, 10);
 const utcDate = (key) => new Date(`${key}T00:00:00.000Z`);
 const businessDateOf = (instant) => isoDate(new Date(instant.getTime() + BUSINESS_UTC_OFFSET_MS));
 
+const hourKey = (day, hour) => `${day}T${String(hour).padStart(2, "0")}`;
+const dayOfKey = (key) => key.slice(0, 10);
+
 function bucketStartKey(key, granularity) {
+  if (granularity === "hour") return key.length > 10 ? key : hourKey(key, 0);
   const date = utcDate(key);
   if (granularity === "week") {
     const sinceMonday = (date.getUTCDay() + 6) % 7;
@@ -53,6 +58,10 @@ function bucketStartKey(key, granularity) {
 }
 
 function nextBucketKey(key, granularity) {
+  if (granularity === "hour") {
+    const hour = Number(key.slice(11, 13));
+    return hour < 23 ? hourKey(dayOfKey(key), hour + 1) : hourKey(isoDate(new Date(utcDate(dayOfKey(key)).getTime() + DAY_MS)), 0);
+  }
   const date = utcDate(key);
   if (granularity === "week") return isoDate(new Date(date.getTime() + 7 * DAY_MS));
   if (granularity === "month") return isoDate(new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 1)));
@@ -61,7 +70,7 @@ function nextBucketKey(key, granularity) {
 
 function bucketKeys(fromKey, toKey, granularity) {
   const keys = [];
-  for (let key = bucketStartKey(fromKey, granularity); key <= toKey; key = nextBucketKey(key, granularity)) {
+  for (let key = bucketStartKey(fromKey, granularity); dayOfKey(key) <= toKey; key = nextBucketKey(key, granularity)) {
     keys.push(key);
     if (keys.length > MAX_BUCKETS[granularity]) break;
   }
@@ -69,6 +78,7 @@ function bucketKeys(fromKey, toKey, granularity) {
 }
 
 function autoGranularity(days) {
+  if (days <= 1) return "hour";
   if (days <= 62) return "day";
   if (days <= 366) return "week";
   return "month";
@@ -91,7 +101,7 @@ function parseTimeSeriesQuery(query = {}, now = new Date()) {
   const days = Math.round((utcDate(to) - utcDate(from)) / DAY_MS) + 1;
   const requested = String(query.granularity || "auto").toLowerCase();
   if (requested !== "auto" && !GRANULARITIES.includes(requested)) {
-    throw badRequest("Invalid granularity: use day, week, month or auto");
+    throw badRequest("Invalid granularity: use hour, day, week, month or auto");
   }
   const granularity = requested === "auto" ? autoGranularity(days) : requested;
   const keys = bucketKeys(from, to, granularity);
@@ -107,6 +117,7 @@ function parseTimeSeriesQuery(query = {}, now = new Date()) {
 // Lubumbashi, so stepping back whole days to Monday is exact).
 function bucketKeyExpression(dateExpression, granularity) {
   const toKey = (date, format) => ({ $dateToString: { date, format, timezone: BUSINESS_TIMEZONE } });
+  if (granularity === "hour") return toKey(dateExpression, "%Y-%m-%dT%H");
   if (granularity === "month") return toKey(dateExpression, "%Y-%m-01");
   if (granularity === "week") {
     const daysSinceMonday = { $subtract: [{ $isoDayOfWeek: { date: dateExpression, timezone: BUSINESS_TIMEZONE } }, 1] };
@@ -264,6 +275,18 @@ async function buildFinancialTimeSeries({ category = null, query = {}, now = new
     cell.total.sales = distinctSales.get(key) || 0;
     addCents(grand, cell.total);
 
+    if (granularity === "hour") {
+      // An hour always lies inside its business day: start/end name that day.
+      return {
+        date: key,
+        start: dayOfKey(key),
+        end: dayOfKey(key),
+        hour: Number(key.slice(11, 13)),
+        partial: false,
+        ...present(cell.total),
+        byCategory: Object.fromEntries(categories.map((name) => [name, present(cell.categories[name])])),
+      };
+    }
     // A bucket is clipped to the requested range (first and last week/month).
     const nextKey = nextBucketKey(key, granularity);
     const lastDay = isoDate(new Date(utcDate(nextKey).getTime() - DAY_MS));
