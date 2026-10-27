@@ -1,4 +1,5 @@
 const mongoose = require("mongoose");
+const { COMPANY_PHONE } = require("../utils/company");
 
 const shopSettingsSchema = new mongoose.Schema(
   {
@@ -9,7 +10,7 @@ const shopSettingsSchema = new mongoose.Schema(
     },
     shopNumber: {
       type: String,
-      default: "+243 975 085 799",
+      default: COMPANY_PHONE,
     },
     shopRegistration: { type: String, default: "LSH/RCCM/22-A-01266" },
     receiptFooter: {

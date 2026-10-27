@@ -12,6 +12,7 @@ const {
   receiptLines,
   receiptTotalFC,
 } = require('../utils/receiptLayout');
+const { COMPANY_PHONE } = require('../utils/company');
 
 router.use(authMiddleware);
 
@@ -93,7 +94,7 @@ router.post('/receipt', async (req, res) => {
           .align('lt')
           .text(receiptData.shopAddress)
           .text(receiptData.shopRegistration)
-          .text(receiptData.shopNumber)
+          .text(COMPANY_PHONE)
           .text(`${labels.date}: ${receiptData.date}`)
           .text(`${labels.receiptNo}: ${receiptData.receiptNumber}`)
           .feed(1);

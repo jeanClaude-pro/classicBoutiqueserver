@@ -30,6 +30,7 @@ const path = require("node:path");
 const mongoose = require("mongoose");
 const Product = require("../models/Product");
 const ShopSettings = require("../models/ShopSettings");
+const { COMPANY_PHONE } = require("../utils/company");
 const {
   calculateTotalAcquisitionValue,
   normalizeMainCategory,
@@ -76,7 +77,7 @@ async function main() {
       $set: {
         shopName: "ETS DOUBLE M CLASSIC BOUTIQUE",
         shopAddress: "780 AV. Du 30 Juin Coin Tabora, Q/MAKUTANO, C/Lubumbashi",
-        shopNumber: "+243 975 085 799",
+        shopNumber: COMPANY_PHONE,
         shopRegistration: "LSH/RCCM/22-A-01266",
       },
     },

@@ -3,6 +3,7 @@ const router = express.Router();
 const ShopSettings = require("../models/ShopSettings");
 const authMiddleware = require("../middleware/auth");
 const { recordAudit } = require("../services/auditLog");
+const { COMPANY_PHONE } = require("../utils/company");
 
 router.use(authMiddleware);
 
@@ -10,6 +11,10 @@ async function getOrCreateSettings() {
   let settings = await ShopSettings.findOne();
   if (!settings) {
     settings = await ShopSettings.create({});
+  }
+  if (settings.shopNumber !== COMPANY_PHONE) {
+    settings.shopNumber = COMPANY_PHONE;
+    await settings.save();
   }
   return settings;
 }
@@ -31,7 +36,7 @@ router.put("/receipt", async (req, res) => {
     if (req.user.role !== "superadmin") {
       return res.status(403).json({ message: "Accès refusé. Réservé aux administrateurs." });
     }
-    const fields = { shopName: 120, shopAddress: 300, shopNumber: 60, shopRegistration: 120, receiptFooter: 500 };
+    const fields = { shopName: 120, shopAddress: 300, shopRegistration: 120, receiptFooter: 500 };
     const settings = await getOrCreateSettings();
     const before = {};
     for (const [field, maxLength] of Object.entries(fields)) {
@@ -43,6 +48,8 @@ router.put("/receipt", async (req, res) => {
       before[field] = settings[field];
       settings[field] = value.trim();
     }
+
+    settings.shopNumber = COMPANY_PHONE;
 
     await settings.save();
     await recordAudit({ req, action: "SETTINGS_UPDATED", targetType: "ShopSettings", targetId: settings._id, before, after: Object.fromEntries(Object.keys(before).map((field) => [field, settings[field]])) });

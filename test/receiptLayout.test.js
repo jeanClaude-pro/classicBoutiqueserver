@@ -152,6 +152,13 @@ const receiptData = {
   stubNumber: "V-0001",
 };
 
+test("the thermal receipt ignores a stale client number and prints the canonical company telephone", async () => {
+  const { text } = await printThroughRoute("receipt", { ...receiptData, shopNumber: "+243 000 000 000" });
+  const printed = text.join("\n");
+  assert.match(printed, /\+243 975 085 799/);
+  assert.doesNotMatch(printed, /\+243 000 000 000/);
+});
+
 test("the thermal receipt and stub print FC-only amounts with no $ at all", async () => {
   for (const route of ["receipt", "stub"]) {
     const { commands, text } = await printThroughRoute(route, receiptData);
