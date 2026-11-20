@@ -4,7 +4,7 @@ const Expense = require("../models/Expense");
 const Creditor = require("../models/Creditor");
 const mongoose = require("mongoose");
 const authMiddleware = require("../middleware/auth");
-const { requireRole, validateObjectIdParam } = require("../middleware/security");
+const { developmentOnly, requireRole, validateObjectIdParam } = require("../middleware/security");
 const { requireModuleAccess } = require("../middleware/moduleAccess");
 const { recordAudit } = require("../services/auditLog");
 const { literalSearchRegex } = require("../utils/validation");
@@ -1705,7 +1705,7 @@ router.get("/status/:status", authMiddleware, async (req, res) => {
 });
 
 /** ---------- TEST EMAIL ENDPOINT ---------- **/
-router.get("/test/email", authMiddleware, requireRole("superadmin"), async (req, res) => {
+router.get("/test/email", developmentOnly, authMiddleware, requireRole("superadmin"), async (req, res) => {
   try {
     // Create a test expense object
     const testExpense = {
@@ -1736,7 +1736,7 @@ router.get("/test/email", authMiddleware, requireRole("superadmin"), async (req,
 });
 
 /** ---------- TEST UPDATE EMAIL ENDPOINT ---------- **/
-router.get("/test/email-update", authMiddleware, requireRole("superadmin"), async (req, res) => {
+router.get("/test/email-update", developmentOnly, authMiddleware, requireRole("superadmin"), async (req, res) => {
   try {
     // Create a test expense object
     const testExpense = {
@@ -1769,7 +1769,7 @@ router.get("/test/email-update", authMiddleware, requireRole("superadmin"), asyn
 });
 
 /** ---------- TEST DELETE EMAIL ENDPOINT ---------- **/
-router.get("/test/email-delete", authMiddleware, requireRole("superadmin"), async (req, res) => {
+router.get("/test/email-delete", developmentOnly, authMiddleware, requireRole("superadmin"), async (req, res) => {
   try {
     // Create a test expense info object
     const testExpenseInfo = {

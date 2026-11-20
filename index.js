@@ -12,6 +12,8 @@ const { repairReversalIndex } = require("./scripts/migrateExpenseAccounting");
 const { MODULES, blockShareholderMutations, requireAssignedCategory, requireShareholderModule } = require("./middleware/authorization");
 const { requireModuleAccess } = require("./middleware/moduleAccess");
 const { productStockSheet, stockSheet, salesSheet } = require("./routes/operationalReports");
+const { REAUTH_HEADER, requireReportsReauth } = require("./middleware/reauth");
+const { rateLimit } = require("express-rate-limit");
 
 const app = express();
 const printRoutes = require('./routes/print');
@@ -65,7 +67,7 @@ app.use(cors({
     return callback(new Error("Origin not allowed by CORS"));
   },
   methods: ["GET", "HEAD", "PUT", "PATCH", "POST", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Authorization", "Content-Type", "Accept", "X-Requested-With"],
+  allowedHeaders: ["Authorization", "Content-Type", "Accept", "X-Requested-With", REAUTH_HEADER],
   credentials: false,
   optionsSuccessStatus: 200,
 }));
@@ -112,6 +114,18 @@ app.use("/api", (_req, res, next) => {
   next();
 });
 
+// General abuse limit for the whole API (login and sign-up keep their own,
+// much stricter limits). Generous enough for several tills sharing the
+// shop's public IP; no rate-limit headers, so the window is not revealed.
+app.use("/api", rateLimit({
+  windowMs: 60 * 1000,
+  limit: Number(process.env.API_RATE_LIMIT_PER_MINUTE) || 600,
+  standardHeaders: false,
+  legacyHeaders: false,
+  skip: (req) => req.path === "/health",
+  message: { message: "Too many requests. Please try again later." },
+}));
+
 const guarded = (modules, categorySensitive = false) => [
   authMiddleware,
   requireShareholderModule(...modules),
@@ -127,7 +141,8 @@ app.get("/api/health", (_req, res) => {
 });
 app.get("/api/products/stock-sheet", ...guarded([MODULES.PRODUCTS], true), requireModuleAccess("/products"), stockSheet);
 app.get("/api/products/:id/stock-sheet", ...guarded([MODULES.PRODUCTS], true), requireModuleAccess("/products"), productStockSheet);
-app.get("/api/analytics/sales-sheet", ...guarded([MODULES.REPORTS], true), requireModuleAccess("/reports"), salesSheet);
+// Superadmin reports require a recent password confirmation (see middleware/reauth.js).
+app.get("/api/analytics/sales-sheet", ...guarded([MODULES.REPORTS], true), requireModuleAccess("/reports"), requireReportsReauth, salesSheet);
 app.use("/api/products", ...guarded([MODULES.PRODUCTS], true), require("./routes/products"));
 app.use("/api/sales", ...guarded([MODULES.SALES_HISTORY], true), require("./routes/sales"));
 app.use("/api/customers", ...guarded([MODULES.CUSTOMERS]), require("./routes/customers"));
@@ -140,13 +155,16 @@ app.use("/api/expenses", ...guarded([MODULES.EXPENSES]), require("./routes/expen
 app.use("/api/exchange-rates", ...guarded([MODULES.EXCHANGE_RATES]), require("./routes/exchangeRates"));
 app.use("/api/entries", ...guarded([MODULES.ENTRIES]), require("./routes/entries"));
 app.use("/api/settings", ...guarded([MODULES.REPORTS, MODULES.SALES_HISTORY]), require("./routes/settings"));
-app.use("/api/analytics", ...guarded([MODULES.REPORTS], true), require("./routes/analytics"));
+app.use("/api/analytics", ...guarded([MODULES.REPORTS], true), requireReportsReauth, require("./routes/analytics"));
 app.use("/api/creditors", ...guarded([MODULES.DEBTS]), require("./routes/creditors"));
 app.use("/api/audit-logs", require("./routes/auditLogs"));
-// Default route
-app.get("/", (req, res) => {
-  res.send("ERP/POS System Backend is running...");
+// Default route: says nothing about the software behind it.
+app.get("/", (_req, res) => {
+  res.json({ ok: true });
 });
+
+// Unknown API routes answer in JSON, never with the framework's HTML page.
+app.use("/api", (_req, res) => res.status(404).json({ message: "Not found" }));
 
 app.use((error, _req, res, _next) => {
   if (error?.message === "Origin not allowed by CORS") return res.status(403).json({ message: "Origin not allowed" });

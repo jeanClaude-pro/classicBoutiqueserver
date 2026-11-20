@@ -9,6 +9,7 @@ const authMiddleware = require("../middleware/auth");
 const { rateLimit } = require("express-rate-limit");
 const { loginThrottleGuard, recordLoginFailure, recordLoginSuccess } = require("../middleware/loginThrottle");
 const { recordAudit } = require("../services/auditLog");
+const { issueReauthToken } = require("../middleware/reauth");
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const INVALID_CREDENTIALS = { message: "Invalid email or password" };
@@ -112,10 +113,41 @@ router.post("/login", loginThrottleGuard, async (req, res) => {
     // Who opened a session, when and from where: needed to attribute every
     // later transaction on a shared till.
     await recordAudit({ req, actor: user, action: "LOGIN_SUCCESS", targetType: "User", targetId: user._id });
-    console.log("User logged in:", user._id.toString());
     return res.status(200).json({ user: safeUser(user), token });
   } catch (error) {
     console.error("Error logging in user:", error?.name || "Error");
+    return res.status(500).json({ message: "Internal server error" });
+  }
+});
+
+// The client never trusts the user profile it stored at sign-in: at start-up
+// (and after a reconnection) it asks the server who this session belongs to.
+// authMiddleware has already refused an expired, revoked or disabled session.
+router.get("/session", authMiddleware, (req, res) => {
+  res.set("Cache-Control", "no-store");
+  return res.json({ user: safeUser(req.user) });
+});
+
+// Password confirmation for sensitive screens (reports). It never opens a new
+// session: it returns a 15-minute proof bound to the current session only.
+// Wrong passwords count toward the same lockout as the login form.
+const reauthThrottle = (req, _res, next) => { req.throttleEmail = req.user?.email; next(); };
+router.post("/reauth", authMiddleware, reauthThrottle, loginThrottleGuard, async (req, res) => {
+  try {
+    const password = typeof req.body?.password === "string" ? req.body.password : "";
+    if (!password || password.length > 128) return res.status(400).json({ message: "Missing credentials" });
+    const user = await User.findById(req.user._id).select("+password +tokenVersion");
+    const ok = Boolean(user) && await bcrypt.compare(password, user.password || DUMMY_HASH);
+    if (!ok) {
+      const { accountLocked } = await recordLoginFailure(req, req.user.email);
+      await recordAudit({ req, action: "REAUTH_FAILED", outcome: "failure", targetType: "User", targetId: req.user._id, details: { locked: accountLocked } });
+      return res.status(403).json({ error: "REAUTH_INVALID", code: "REAUTH_INVALID", message: "Mot de passe incorrect" });
+    }
+    await recordLoginSuccess(req, req.user.email);
+    await recordAudit({ req, action: "REAUTH_SUCCESS", targetType: "User", targetId: req.user._id });
+    return res.json(issueReauthToken(user, req.auth));
+  } catch (error) {
+    console.error("Error confirming password:", error?.name || "Error");
     return res.status(500).json({ message: "Internal server error" });
   }
 });

@@ -12,6 +12,7 @@ const { MODULES, blockShareholderMutations, requireAssignedCategory, requireShar
 const { requireModuleAccess } = require("../../middleware/moduleAccess");
 const User = require("../../models/User");
 const { productStockSheet, stockSheet, salesSheet } = require("../../routes/operationalReports");
+const { REAUTH_HEADER, issueReauthToken, requireReportsReauth } = require("../../middleware/reauth");
 
 function createApp() {
   const app = express();
@@ -25,12 +26,12 @@ function createApp() {
   ];
   app.get("/api/products/stock-sheet", ...guarded([MODULES.PRODUCTS], true), requireModuleAccess("/products"), stockSheet);
   app.get("/api/products/:id/stock-sheet", ...guarded([MODULES.PRODUCTS], true), requireModuleAccess("/products"), productStockSheet);
-  app.get("/api/analytics/sales-sheet", ...guarded([MODULES.REPORTS], true), requireModuleAccess("/reports"), salesSheet);
+  app.get("/api/analytics/sales-sheet", ...guarded([MODULES.REPORTS], true), requireModuleAccess("/reports"), requireReportsReauth, salesSheet);
   app.use("/api/products", ...guarded([MODULES.PRODUCTS], true), require("../../routes/products"));
   app.use("/api/sales", ...guarded([MODULES.SALES_HISTORY], true), require("../../routes/sales"));
   app.use("/api/expenses", ...guarded([MODULES.EXPENSES]), require("../../routes/expenses"));
   app.use("/api/entries", ...guarded([MODULES.ENTRIES]), require("../../routes/entries"));
-  app.use("/api/analytics", ...guarded([MODULES.REPORTS], true), require("../../routes/analytics"));
+  app.use("/api/analytics", ...guarded([MODULES.REPORTS], true), requireReportsReauth, require("../../routes/analytics"));
   app.use("/api/customers", ...guarded([MODULES.CUSTOMERS]), require("../../routes/customers"));
   app.use("/api/users", require("../../routes/users"));
   app.use("/api/auth", require("../../routes/auth"));
@@ -41,6 +42,13 @@ function createApp() {
   return app;
 }
 
+/** A valid reports confirmation proof for the session carried by `token`. */
+function reauthProofFor(token) {
+  const decoded = jwt.decode(token);
+  if (!decoded?.id) return null;
+  return issueReauthToken({ _id: decoded.id, tokenVersion: decoded.tv || 0 }, { jti: decoded.jti }).reauthToken;
+}
+
 async function startApp() {
   const app = createApp();
   const server = await new Promise((resolve) => {
@@ -49,10 +57,18 @@ async function startApp() {
   const base = `http://127.0.0.1:${server.address().port}/api`;
   return {
     base,
-    async request(method, url, { token, body } = {}) {
+    // Reports require a password confirmation proof for the superadmin. Tests
+    // get a valid proof for their session by default; pass reauth: false to
+    // test the refusal, or a string to send a specific proof.
+    async request(method, url, { token, body, reauth = true } = {}) {
+      const proof = typeof reauth === "string" ? reauth : reauth && token ? reauthProofFor(token) : null;
       const response = await fetch(`${base}${url}`, {
         method,
-        headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          ...(proof ? { [REAUTH_HEADER]: proof } : {}),
+        },
         body: body === undefined ? undefined : JSON.stringify(body),
       });
       const text = await response.text();
@@ -75,4 +91,4 @@ async function createUser(role, extra = {}) {
   return { user, token: jwt.sign({ id: user._id.toString() }, process.env.JWT_SECRET) };
 }
 
-module.exports = { createApp, startApp, createUser };
+module.exports = { createApp, startApp, createUser, reauthProofFor };

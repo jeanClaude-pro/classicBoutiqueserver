@@ -33,4 +33,11 @@ function requireRole(...roles) {
   };
 }
 
-module.exports = { preventNoSqlInjection, requireRole, validateObjectIdParam };
+// Diagnostic endpoints (test emails...) exist for development only: in
+// production they answer exactly like a route that does not exist.
+function developmentOnly(_req, res, next) {
+  if (process.env.NODE_ENV === "production") return res.status(404).json({ message: "Not found" });
+  next();
+}
+
+module.exports = { developmentOnly, preventNoSqlInjection, requireRole, validateObjectIdParam };

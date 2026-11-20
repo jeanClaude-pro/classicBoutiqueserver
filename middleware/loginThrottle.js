@@ -61,7 +61,8 @@ async function countFailure({ key, kind, email, windowMs, maxFailures, blockMs, 
 async function loginThrottleGuard(req, res, next) {
   try {
     const now = new Date();
-    const email = normalizeEmail(req.body?.email);
+    // Password confirmation (reauth) throttles the signed-in account's email.
+    const email = normalizeEmail(req.throttleEmail ?? req.body?.email);
     if (await isBlocked(ipKey(req.ip), now) || (email && await isBlocked(accountKey(req.ip, email), now))) {
       req.loginThrottled = true;
       return res.status(429).json(TOO_MANY);

@@ -142,10 +142,15 @@ async function aggregatePeriod(createdAt, category = null, { withAccounting = tr
         },
       },
     ]).allowDiskUse(true),
-    Entry.aggregate([
-      { $match: { createdAt, status: "active" } },
-      { $group: { _id: null, count: { $sum: 1 }, amount: { $sum: "$amount" } } },
-    ]),
+    // Money-in entries carry a free-text category ("Apport", ...), never
+    // CLOTHES or SHOES: they belong to the whole shop, so a category view
+    // leaves them out instead of attributing shop-wide money to one category.
+    category
+      ? Promise.resolve([])
+      : Entry.aggregate([
+        { $match: { createdAt, status: "active" } },
+        { $group: { _id: null, count: { $sum: 1 }, amount: { $sum: "$amount" } } },
+      ]),
     // Cash-out workflow statistics. Unclassified legacy cash-outs stay in the
     // global totals and are never attributed to CLOTHES or SHOES.
     Expense.aggregate([
@@ -203,6 +208,8 @@ async function aggregatePeriod(createdAt, category = null, { withAccounting = tr
     totalProducts: salesFacet.productCount?.[0]?.total || 0,
     totalEntries: entries.amount,
     entryCount: entries.count,
+    // false in a category view: entries (and debts) are shop-wide only.
+    entriesIncluded: !category,
     totalValidatedExpenses: validatedExpenses.amount,
     validatedExpenseCount: validatedExpenses.count,
     netCash: calculateNetCash(
@@ -275,7 +282,9 @@ router.get("/summary", async (req, res) => {
         },
         { $sort: { _id: 1 } },
       ]).allowDiskUse(true),
-      isSuperadmin(req.user) ? aggregateDebt(currentRange) : Promise.resolve(null),
+      // Loans and repayments are not attributed to a category: shown in the
+      // whole-shop view only.
+      isSuperadmin(req.user) && !category ? aggregateDebt(currentRange) : Promise.resolve(null),
       Product.aggregate([
         { $match: { status: "active", mainCategory: { $in: visibleCategories } } },
         { $group: {
@@ -335,6 +344,9 @@ router.get("/summary", async (req, res) => {
       success: true,
       source: "mongodb-aggregation",
       paginated: false,
+      // The category every figure below is restricted to (ALL = whole shop).
+      // A shareholder is always pinned to its assigned category.
+      scope: { category: category || "ALL", shopWideIncluded: !category },
       timeframe: {
         type: timeframe,
         start: currentRange.$gte,
