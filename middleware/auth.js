@@ -2,6 +2,7 @@ const jwt = require("jsonwebtoken");
 const User = require("../models/User");
 const RevokedToken = require("../models/RevokedToken");
 const { JWT_ALGORITHM } = require("../utils/generateToken");
+const { SESSION_COOKIE, readCookie } = require("../utils/sessionCookies");
 
 const unauthorized = (res, code, message = "Authentication required") =>
   res.status(401).json(code ? { code, message } : { message });
@@ -14,10 +15,10 @@ async function authMiddleware(req, res, next) {
   // Routers repeat this middleware after index.js already ran it; the first
   // successful check for this request is authoritative.
   if (req.authenticatedUser && req.user === req.authenticatedUser) return next();
-  const authHeader = req.header("Authorization");
-  if (!authHeader || !authHeader.startsWith("Bearer ")) return unauthorized(res);
-
-  const token = authHeader.slice(7).trim();
+  // The session is only ever read from the httpOnly cookie set at login: the
+  // browser's JavaScript never holds it, so it cannot be stolen by a script.
+  const token = readCookie(req, SESSION_COOKIE);
+  if (!token || token.length > 4096) return unauthorized(res);
   let decoded;
   try {
     decoded = jwt.verify(token, process.env.JWT_SECRET, { algorithms: [JWT_ALGORITHM] });

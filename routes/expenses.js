@@ -12,8 +12,8 @@ const { literalSearchRegex } = require("../utils/validation");
 const MAX_UNPAGED_ROWS = 1000;
 const nodemailer = require("nodemailer");
 const { escapeHtml, htmlSafeRecord } = require("../utils/html");
-const { normalizeAmountSnapshot } = require("../utils/salePricing");
-const { getFallbackExchangeRate } = require("../utils/currentExchangeRate");
+const { CurrencyError, normalizeAmountSnapshot } = require("../utils/salePricing");
+const { CURRENCY, fcExpense } = require("../utils/currency");
 const { calculateValidationRate } = require("../utils/financialCalculations");
 const {
   EXPENSE_TYPES,
@@ -212,10 +212,7 @@ async function sendExpenseNotification(expense) {
       process.env.ADMIN_EMAILS.split(',') : 
       [process.env.DEFAULT_ADMIN_EMAIL || "admin@example.com"];
     
-    const formattedAmount = new Intl.NumberFormat('fr-FR', {
-      style: 'currency',
-      currency: 'USD'
-    }).format(expense.amount);
+    const formattedAmount = formatFC(fcExpense(expense).amount);
     
     const mailOptions = {
       from: process.env.EMAIL_FROM || "noreply@expenses.com",
@@ -282,10 +279,7 @@ async function sendExpenseUpdateNotification(expense, updatedBy, updateReason) {
       process.env.ADMIN_EMAILS.split(',') : 
       [process.env.DEFAULT_ADMIN_EMAIL || "admin@example.com"];
     
-    const formattedAmount = new Intl.NumberFormat('fr-FR', {
-      style: 'currency',
-      currency: 'USD'
-    }).format(expense.amount);
+    const formattedAmount = formatFC(fcExpense(expense).amount);
     
     const mailOptions = {
       from: process.env.EMAIL_FROM || "noreply@expenses.com",
@@ -350,10 +344,7 @@ async function sendExpenseDeletionNotification(expenseInfo, deletedBy) {
       process.env.ADMIN_EMAILS.split(',') : 
       [process.env.DEFAULT_ADMIN_EMAIL || "admin@example.com"];
     
-    const formattedAmount = new Intl.NumberFormat('fr-FR', {
-      style: 'currency',
-      currency: 'USD'
-    }).format(expenseInfo.amount);
+    const formattedAmount = formatFC(expenseInfo.amount);
     
     const mailOptions = {
       from: process.env.EMAIL_FROM || "noreply@expenses.com",
@@ -480,6 +471,29 @@ function duplicateKeyError(res, error) {
   return res.status(409).json({ error: "DUPLICATE_KEY", message: "Cette opération entre en conflit avec un enregistrement existant. Actualisez puis réessayez." });
 }
 
+// "30 000 FC": whole francs, for notifications.
+function formatFC(value) {
+  const amount = Number(value);
+  return `${new Intl.NumberFormat("fr-FR", { maximumFractionDigits: 0 }).format(Number.isFinite(amount) ? amount : 0)} FC`;
+}
+
+// A hydrated Expense (or a plain one) presented in FC for responses, audits
+// and calculations. Pre-cutover records keep their stored USD figures in the
+// database; this only reads them through their own FC snapshot.
+const fcView = (expense) => (expense ? fcExpense(typeof expense.toObject === "function" ? expense.toObject() : expense) : expense);
+
+// A cash-out recorded before the FC-only cutover but still pending has not
+// been accounted for yet: it is converted to FC (its own FC snapshot) before
+// it is validated, so every accounted amount is in francs.
+function convertPendingToFC(expense) {
+  if (expense.currency === CURRENCY) return;
+  const amount = fcView(expense).amount;
+  if (!(Number(amount) > 0)) {
+    throw Object.assign(new Error("Cette dépense n'a pas de montant en FC. Rejetez-la puis enregistrez-la à nouveau en FC."), { status: 409 });
+  }
+  expense.set({ currency: CURRENCY, amount, amountFC: amount, enteredAmount: amount, enteredCurrency: CURRENCY, amountUSD: undefined, exchangeRate: undefined });
+}
+
 async function applyAccountingValidation(expense, session) {
   if (expense.expenseType === EXPENSE_TYPES.REPAYMENT) return;
   if (![EXPENSE_TYPES.COMPANY, EXPENSE_TYPES.GOODS].includes(expense.expenseType)) {
@@ -489,18 +503,14 @@ async function applyAccountingValidation(expense, session) {
   assertCategory(expense.category);
   await acquireAccountingLock(expense.category, session);
   const accounting = await aggregateCategoryAccounting(expense.category, { session });
-  const amountUSD = expense.amountUSD ?? expense.amount;
+  const amount = expense.amount;
   if (expense.expenseType === EXPENSE_TYPES.GOODS) {
-    const snapshot = purchaseSnapshot(accounting, amountUSD);
-    if (expense.exchangeRate) {
-      snapshot.financialSnapshot.capitalUsedFC = Number((snapshot.financialSnapshot.capitalUsed * expense.exchangeRate).toFixed(6));
-      snapshot.financialSnapshot.profitUsedFC = Number((snapshot.financialSnapshot.profitUsed * expense.exchangeRate).toFixed(6));
-    }
+    const snapshot = purchaseSnapshot(accounting, amount);
     expense.fundingSource = snapshot.fundingSource;
     expense.financialSnapshot = snapshot.financialSnapshot;
     return;
   }
-  const after = projectAccounting(accounting, { companyExpenses: amountUSD });
+  const after = projectAccounting(accounting, { companyExpenses: amount });
   expense.financialSnapshot = {
     generatedCapital: accounting.recoveredCapital,
     grossProfit: accounting.grossProfit,
@@ -509,6 +519,8 @@ async function applyAccountingValidation(expense, session) {
     availableBefore: accounting.availablePurchaseFunds,
     capitalUsed: 0,
     profitUsed: 0,
+    capitalUsedFC: 0,
+    profitUsedFC: 0,
     availableAfter: after.availablePurchaseFunds,
     calculatedAt: new Date(),
   };
@@ -517,7 +529,7 @@ async function applyAccountingValidation(expense, session) {
 // Audit view of a cash-out: amount in both currencies, classification,
 // payee, status and the funding snapshot that justified it.
 function expenseAuditSnapshot(expense) {
-  const value = typeof expense?.toObject === "function" ? expense.toObject() : { ...expense };
+  const value = fcView(expense);
   return {
     expenseId: value.expenseId,
     expenseType: value.expenseType,
@@ -527,11 +539,8 @@ function expenseAuditSnapshot(expense) {
     reason: value.reason,
     recipientName: value.recipientName,
     recipientPhone: value.recipientPhone,
-    amountUSD: value.amountUSD ?? value.amount,
-    amountFC: value.amountFC,
-    enteredAmount: value.enteredAmount,
-    enteredCurrency: value.enteredCurrency,
-    exchangeRate: value.exchangeRate,
+    currency: CURRENCY,
+    amount: value.amount,
     paymentMethod: value.paymentMethod,
     recordedBy: value.recordedBy,
     validatedBy: value.validatedBy,
@@ -746,15 +755,13 @@ function replayId(value) {
 }
 
 function sameExpenseRequest(existing, expected) {
-  const textFields = ["expenseType", "category", "reason", "recipientName", "recipientPhone", "paymentMethod", "notes", "enteredCurrency"];
+  const textFields = ["expenseType", "category", "reason", "recipientName", "recipientPhone", "paymentMethod", "notes"];
   if (textFields.some((field) => String(existing[field] ?? "") !== String(expected[field] ?? ""))) return false;
   if (replayId(existing.creditorId) !== replayId(expected.creditorId)) return false;
-  const numberFields = ["amountUSD", "enteredAmount", "exchangeRate"];
-  return numberFields.every((field) => {
-    const left = Number(existing[field] ?? (field === "amountUSD" ? existing.amount : 0));
-    const right = Number(expected[field] ?? (field === "amountUSD" ? expected.amount : 0));
-    return Number.isFinite(left) && Number.isFinite(right) && Math.abs(left - right) < 1e-9;
-  });
+  // Both sides in FC: `existing` may be a pre-cutover record.
+  const left = Number(fcView(existing).amount);
+  const right = Number(expected.amount);
+  return Number.isFinite(left) && Number.isFinite(right) && Math.abs(left - right) < 1e-9;
 }
 
 function requestReplay(existing, actorId, expected) {
@@ -764,7 +771,7 @@ function requestReplay(existing, actorId, expected) {
   if (expected && !sameExpenseRequest(existing, expected)) {
     return { status: 409, body: { error: "IDEMPOTENCY_CONFLICT", message: "Cette clé de requête a déjà été utilisée avec des données différentes." } };
   }
-  return { status: 200, body: existing };
+  return { status: 200, body: fcView(existing) };
 }
 
 async function findRequestReplay(requestKey, actorId, expected) {
@@ -800,13 +807,11 @@ router.post("/", authMiddleware, requireModuleAccess("/sortie"), async (req, res
 
     let amountSnapshot;
     try {
-      amountSnapshot = normalizeAmountSnapshot(
-        req.body,
-        await getFallbackExchangeRate()
-      );
+      amountSnapshot = normalizeAmountSnapshot(req.body);
     } catch (snapshotError) {
-      return res.status(400).json({
-        error: snapshotError.message
+      return res.status(snapshotError instanceof CurrencyError ? 409 : 400).json({
+        error: snapshotError.message,
+        code: snapshotError.code,
       });
     }
 
@@ -830,7 +835,7 @@ router.post("/", authMiddleware, requireModuleAccess("/sortie"), async (req, res
     if (isRepayment) {
       creditor = await Creditor.findOne({ _id: req.body.creditorId, isActive: true }).select("name type remainingBalance").lean();
       if (!creditor) return res.status(400).json({ error: "Selected creditor is unavailable" });
-      if (creditor.remainingBalance + 1e-9 < amountSnapshot.amountUSD) return res.status(409).json({ error: "Repayment exceeds the available debt" });
+      if (creditor.remainingBalance + 1e-9 < amountSnapshot.amount) return res.status(409).json({ error: "Repayment exceeds the available debt" });
     }
     const autoValidate = req.user?.role === "superadmin";
     const now = new Date();
@@ -885,8 +890,8 @@ router.post("/", authMiddleware, requireModuleAccess("/sortie"), async (req, res
         replayed = false;
         if (autoValidate && isRepayment) {
           const updated = await Creditor.findOneAndUpdate(
-            { _id: creditor._id, isActive: true, remainingBalance: { $gte: amountSnapshot.amountUSD } },
-            { $inc: { remainingBalance: -amountSnapshot.amountUSD, totalRepaid: amountSnapshot.amountUSD }, $set: { updatedBy: actorId } },
+            { _id: creditor._id, isActive: true, remainingBalance: { $gte: amountSnapshot.amount } },
+            { $inc: { remainingBalance: -amountSnapshot.amount, totalRepaid: amountSnapshot.amount }, $set: { updatedBy: actorId } },
             { new: true, session }
           );
           if (!updated) throw Object.assign(new Error("Repayment exceeds the available debt"), { status: 409 });
@@ -908,13 +913,13 @@ router.post("/", authMiddleware, requireModuleAccess("/sortie"), async (req, res
 
     if (replayed) {
       if (String(savedExpense.requestedBy) !== String(actorId)) return res.status(409).json({ error: "Cette requête a déjà été utilisée" });
-      return res.status(200).json(savedExpense);
+      return res.status(200).json(fcView(savedExpense));
     }
 
     // Send email notification
-    if (!autoValidate) sendExpenseNotification(savedExpense);
+    if (!autoValidate) sendExpenseNotification(fcView(savedExpense));
 
-    return res.status(201).json(savedExpense);
+    return res.status(201).json(fcView(savedExpense));
   } catch (error) {
     console.error("Error creating expense:", error.code === 11000
       ? { code: error.code, keyPattern: error.keyPattern, keyValue: error.keyValue, message: error.message }
@@ -964,9 +969,13 @@ router.post("/:id/reverse", authMiddleware, async (req, res) => {
 
       await acquireAccountingLock(original.category, session);
       const accounting = await aggregateCategoryAccounting(original.category, { session });
-      const amount = Number(original.amountUSD ?? original.amount);
-      const capitalUsed = Number(original.financialSnapshot?.capitalUsed || 0);
-      const profitUsed = Number(original.financialSnapshot?.profitUsed || 0);
+      // The original may be a pre-cutover record: its FC view supplies the
+      // amount and the frozen funding split the reversal mirrors.
+      const originalFC = fcView(original);
+      const amount = Number(originalFC.amount);
+      if (!(amount > 0)) throw Object.assign(new Error("Cette dépense n'a pas de montant en FC et ne peut pas être annulée automatiquement."), { status: 409 });
+      const capitalUsed = Number(originalFC.financialSnapshot?.capitalUsed || 0);
+      const profitUsed = Number(originalFC.financialSnapshot?.profitUsed || 0);
       // The reversal mirrors the original's frozen funding split exactly.
       const after = projectAccounting(accounting, original.expenseType === EXPENSE_TYPES.COMPANY
         ? { companyExpenses: -amount }
@@ -977,12 +986,11 @@ router.post("/:id/reverse", authMiddleware, async (req, res) => {
         reason: `Annulation: ${original.reason}`,
         recipientName: original.recipientName,
         recipientPhone: original.recipientPhone,
-        amount: original.amount,
-        enteredAmount: original.enteredAmount,
-        enteredCurrency: original.enteredCurrency,
-        amountUSD: original.amountUSD,
-        amountFC: original.amountFC,
-        exchangeRate: original.exchangeRate,
+        currency: CURRENCY,
+        amount,
+        enteredAmount: amount,
+        enteredCurrency: CURRENCY,
+        amountFC: amount,
         paymentMethod: original.paymentMethod,
         status: "validated",
         recordedBy: req.user.username,
@@ -1004,8 +1012,8 @@ router.post("/:id/reverse", authMiddleware, async (req, res) => {
           availableBefore: accounting.availablePurchaseFunds,
           capitalUsed,
           profitUsed,
-          capitalUsedFC: original.financialSnapshot?.capitalUsedFC || 0,
-          profitUsedFC: original.financialSnapshot?.profitUsedFC || 0,
+          capitalUsedFC: capitalUsed,
+          profitUsedFC: profitUsed,
           availableAfter: after.availablePurchaseFunds,
           calculatedAt: new Date(),
         },
@@ -1024,7 +1032,7 @@ router.post("/:id/reverse", authMiddleware, async (req, res) => {
         session,
       });
     });
-    return res.status(201).json(reversal);
+    return res.status(201).json(fcView(reversal));
   } catch (error) {
     if (error.code === 11000) return duplicateKeyError(res, error);
     return accountingError(res, error, "Failed to reverse transaction");
@@ -1043,7 +1051,7 @@ router.get("/:id", authMiddleware, async (req, res) => {
     if (!expense) {
       return res.status(404).json({ error: "Expense not found" });
     }
-    res.json(expense);
+    res.json(fcView(expense));
   } catch (error) {
     console.error("Error fetching expense:", error);
     if (error.name === "CastError") {
@@ -1069,7 +1077,7 @@ router.patch("/:id/validate", authMiddleware, async (req, res) => {
     }
 
     if (expense.status === "validated") {
-      return res.json(expense);
+      return res.json(fcView(expense));
     }
 
     if (expense.status === "rejected") {
@@ -1090,11 +1098,12 @@ router.patch("/:id/validate", authMiddleware, async (req, res) => {
         if (current.status === "validated") { updatedExpense = current; return; }
         if (current.status !== "pending") throw Object.assign(new Error("Cannot validate a rejected expense"), { status: 409 });
         if (current.expenseType === "repayment") current.expenseType = EXPENSE_TYPES.REPAYMENT;
+        convertPendingToFC(current);
         if (current.expenseType === EXPENSE_TYPES.REPAYMENT) {
           if (current.repaymentAppliedAt) throw Object.assign(new Error("Repayment was already applied"), { status: 409 });
           const creditor = await Creditor.findOneAndUpdate(
-            { _id: current.creditorId, isActive: true, remainingBalance: { $gte: current.amountUSD } },
-            { $inc: { remainingBalance: -current.amountUSD, totalRepaid: current.amountUSD }, $set: { updatedBy: actorId } },
+            { _id: current.creditorId, isActive: true, remainingBalance: { $gte: current.amount } },
+            { $inc: { remainingBalance: -current.amount, totalRepaid: current.amount }, $set: { updatedBy: actorId } },
             { new: true, session }
           );
           if (!creditor) throw Object.assign(new Error("Repayment exceeds the available debt or creditor is inactive"), { status: 409 });
@@ -1113,13 +1122,13 @@ router.patch("/:id/validate", authMiddleware, async (req, res) => {
           req, action: "EXPENSE_VALIDATED", targetType: "Expense", targetId: req.params.id,
           before: { status: "pending" },
           after: expenseAuditSnapshot(updatedExpense),
-          details: { expenseId: updatedExpense.expenseId, amountUSD: updatedExpense.amountUSD ?? updatedExpense.amount },
+          details: { expenseId: updatedExpense.expenseId, amount: updatedExpense.amount, currency: CURRENCY },
           session,
         });
       });
     } finally { await session.endSession(); }
 
-    res.json(updatedExpense);
+    res.json(fcView(updatedExpense));
   } catch (error) {
     console.error("Error validating expense:", error);
     if (error.name === "CastError") {
@@ -1176,7 +1185,7 @@ router.patch("/:id/reject", authMiddleware, async (req, res) => {
     }
 
     await recordAudit({ req, action: "EXPENSE_REJECTED", targetType: "Expense", targetId: req.params.id, after: { status: updatedExpense.status }, details: { expenseId: updatedExpense.expenseId } });
-    res.json(updatedExpense);
+    res.json(fcView(updatedExpense));
   } catch (error) {
     console.error("Error rejecting expense:", error);
     if (error.name === "CastError") {
@@ -1250,32 +1259,23 @@ router.put("/:id", authMiddleware, async (req, res) => {
       });
     }
 
-    // Money that already left the till keeps its historical amount, currency
-    // and exchange rate; only descriptive fields of a legacy cash-out change.
-    if (existingExpense.status === "validated" &&
-        Math.round(Number(existingExpense.amount) * 100) !== Math.round(expenseAmount * 100)) {
+    // Money that already left the till keeps its historical amount; only
+    // descriptive fields of a legacy cash-out change. Compared in FC.
+    const existingAmountFC = Number(fcView(existingExpense).amount);
+    const amountChanged = Math.round(existingAmountFC * 100) !== Math.round(expenseAmount * 100);
+    if (existingExpense.status === "validated" && amountChanged) {
       return res.status(409).json({ error: "The amount of a validated cash-out is immutable" });
     }
 
-    let amountSnapshot;
+    // An unchanged amount leaves the recorded money fields untouched; a new
+    // amount (pending or rejected cash-out only) is recorded in FC.
+    let amountSnapshot = {};
     try {
-      const hasExplicitSnapshot = Boolean(req.body.enteredCurrency) && existingExpense.status !== "validated";
-      const amountChanged = existingExpense.status !== "validated" && Number(existingExpense.amount) !== expenseAmount;
-      amountSnapshot = hasExplicitSnapshot || amountChanged
-        ? normalizeAmountSnapshot(
-            req.body,
-            existingExpense.exchangeRate ?? (await getFallbackExchangeRate())
-          )
-        : {
-            amount: existingExpense.amount,
-            enteredAmount: existingExpense.enteredAmount ?? existingExpense.amount,
-            enteredCurrency: existingExpense.enteredCurrency ?? "USD",
-            amountUSD: existingExpense.amountUSD ?? existingExpense.amount,
-            amountFC: existingExpense.amountFC,
-            exchangeRate: existingExpense.exchangeRate,
-          };
+      if (amountChanged || (req.body.enteredCurrency && existingExpense.currency !== CURRENCY && existingExpense.status !== "validated")) {
+        amountSnapshot = { ...normalizeAmountSnapshot(req.body), $unset: { amountUSD: 1, exchangeRate: 1 } };
+      }
     } catch (pricingError) {
-      return res.status(400).json({ error: pricingError.message });
+      return res.status(pricingError instanceof CurrencyError ? 409 : 400).json({ error: pricingError.message, code: pricingError.code });
     }
 
     // Prepare update data
@@ -1319,10 +1319,10 @@ router.put("/:id", authMiddleware, async (req, res) => {
     });
 
     // Send update notification
-    sendExpenseUpdateNotification(updatedExpense, req.user?.id || "Unknown", sanitizedUpdateReason);
+    sendExpenseUpdateNotification(fcView(updatedExpense), req.user?.id || "Unknown", sanitizedUpdateReason);
 
     res.json({
-      ...updatedExpense.toObject(),
+      ...fcView(updatedExpense),
       message: "Expense updated successfully"
     });
   } catch (error) {
@@ -1362,7 +1362,8 @@ router.delete("/:id/admin", authMiddleware, async (req, res) => {
       id: expense._id,
       expenseId: expense.expenseId,
       reason: expense.reason,
-      amount: expense.amount,
+      amount: fcView(expense).amount,
+      currency: CURRENCY,
       status: expense.status,
       recipientName: expense.recipientName
     };
@@ -1501,11 +1502,13 @@ router.get("/stats/summary", authMiddleware, async (req, res) => {
     ]);
 
     // Get top expenses
-    const topExpenses = await Expense.find(timeframeFilter)
-      .sort({ amount: -1 })
-      .limit(10)
-      .select('expenseId reason amount status recipientName createdAt')
-      .lean();
+    // Ranked in FC (an aggregation is presented in FC by the model hook).
+    const topExpenses = await Expense.aggregate([
+      { $match: timeframeFilter },
+      { $sort: { amount: -1 } },
+      { $limit: 10 },
+      { $project: { expenseId: 1, reason: 1, amount: 1, currency: 1, status: 1, recipientName: 1, createdAt: 1 } },
+    ]);
 
     // Get most frequent recipients
     const frequentRecipients = await Expense.aggregate([

@@ -57,7 +57,7 @@ itest("index repair drops reversalOf_1 and keeps the partial replacement", async
 itest("three consecutive normal expenses are each inserted once with reversalOf null", async () => {
   const requests = [
     companyExpense("Loyer", { amount: 5, requestKey: "key-0" }),
-    companyExpense("Électricité", { amount: 23100, enteredCurrency: "FC", exchangeRate: 2310, requestKey: "key-1" }),
+    companyExpense("Électricité", { amount: 23100, enteredCurrency: "FC", requestKey: "key-1" }),
     companyExpense("Transport", { amount: 7, requestKey: "key-2" }),
   ];
   const created = [];
@@ -74,9 +74,9 @@ itest("three consecutive normal expenses are each inserted once with reversalOf 
   assert.equal(new Set(created.map((expense) => expense.expenseId)).size, 3, "expense IDs are unique");
   assert.deepEqual(created.map((expense) => expense.requestKey), requests.map((request) => request.requestKey));
   assert.deepEqual(
-    [created[1].enteredAmount, created[1].enteredCurrency, created[1].amountUSD, created[1].amountFC, created[1].exchangeRate],
-    [23100, "FC", 10, 23100, 2310],
-    "the server preserves the entered FC amount and computes USD with FC = USD × rate"
+    [created[1].currency, created[1].amount, created[1].enteredAmount, created[1].enteredCurrency, created[1].amountFC, created[1].amountUSD, created[1].exchangeRate],
+    ["FC", 23100, 23100, "FC", 23100, undefined, undefined],
+    "every amount is recorded in FC; there is no dollar amount and no rate"
   );
   for (const { reason } of requests) assert.equal(await Expense.countDocuments({ reason }), 1);
 

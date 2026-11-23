@@ -123,11 +123,11 @@ test("15. mixed-sale pipeline removes unauthorized items", () => {
     { $unwind: "$items" },
     { $match: { "items.mainCategory": "CLOTHES" } },
   ]);
-  assert.equal(stages[4].$group.authorizedItems.$push, "$items");
+  assert.equal(stages[3].$group.authorizedItems.$push, "$items");
 });
 
 test("16. mixed-sale pipeline recalculates restricted sale totals", () => {
-  const set = categoryRestrictedSaleStages("SHOES")[5].$set;
+  const set = categoryRestrictedSaleStages("SHOES")[4].$set;
   for (const field of ["sale.subtotal", "sale.total", "sale.totalRevenue", "sale.costOfGoodsSold", "sale.grossProfit"]) {
     assert.ok(set[field], `${field} must be recalculated`);
   }

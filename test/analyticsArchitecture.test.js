@@ -64,9 +64,9 @@ test("shareholder amounts are derived after company expenses by the single accou
   assert.doesNotMatch(serverAnalytics, /calculateCategoryAccounting|\$divide/);
 });
 
-test("historical FC profitability never uses the current exchange-rate endpoint", () => {
-  assert.match(accountingService, /\$items\.exchangeRate/);
-  assert.match(accountingService, /\$exchangeRate/);
-  assert.doesNotMatch(accountingService, /getFallbackExchangeRate|ExchangeRate/);
-  assert.doesNotMatch(clientAnalytics, /exchange-rates\/current/);
+test("accounting is FC-only and never reads an exchange rate", () => {
+  // Historical records are presented in FC by the model hooks
+  // (utils/currency.js); the accounting itself knows no rate.
+  assert.doesNotMatch(accountingService, /exchangeRate|ExchangeRate|amountUSD|priceUSD/);
+  assert.doesNotMatch(clientAnalytics, /exchange-rates/);
 });

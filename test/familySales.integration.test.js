@@ -14,13 +14,12 @@ const itest = (name, fn) => test(name, { skip: SKIP }, fn);
 
 let keyCounter = 0;
 async function familyBody(product, customer, overrides = {}) {
-  await ctx.setRate(2850);
   keyCounter += 1;
   return {
     customer: { name: customer.name, phone: customer.phone || "" },
     familyMemberId: String(customer._id), isFamilySale: true, isWalkIn: false,
-    offline: false, exchangeRate: 2850, paymentMethod: "cash", requestKey: `family-${keyCounter}-${Date.now()}`,
-    items: [{ productId: String(product._id), quantity: 1, price: 15, enteredPrice: 15, enteredCurrency: "USD", exchangeRate: 2850 }],
+    offline: false, currency: "FC", paymentMethod: "cash", requestKey: `family-${keyCounter}-${Date.now()}`,
+    items: [{ productId: String(product._id), quantity: 1, price: 15, enteredPrice: 15, enteredCurrency: "FC" }],
     ...overrides,
   };
 }
@@ -89,7 +88,7 @@ itest("a registered family member may receive a one-item discount down to acquis
   const body = await familyBody(product, customer, {
     customer: { name: "Forged name", phone: "000" },
     familyMemberName: "Forged",
-    items: [{ productId: String(product._id), quantity: 1, price: 10, enteredPrice: 10, enteredCurrency: "USD", exchangeRate: 2850 }],
+    items: [{ productId: String(product._id), quantity: 1, price: 10, enteredPrice: 10, enteredCurrency: "FC" }],
   });
   const response = await postSale("superadmin", body);
   assert.equal(response.status, 201, JSON.stringify(response.body));
@@ -102,10 +101,10 @@ itest("a registered family member may receive a one-item discount down to acquis
   assert.equal(String(sale.familyAuthorizedBy), String(ctx.users.superadmin.user._id));
   assert.ok(sale.familyAuthorizedAt instanceof Date);
   assert.deepEqual(
-    [sale.items[0].referenceUnitSellingPrice, sale.items[0].discountApplied, sale.items[0].discountPerUnit, sale.items[0].priceUSD],
+    [sale.items[0].referenceUnitSellingPrice, sale.items[0].discountApplied, sale.items[0].discountPerUnit, sale.items[0].priceFC],
     [20, true, 10, 10],
   );
-  assert.equal(sale.exchangeRate, 2850);
+  assert.deepEqual([sale.currency, sale.exchangeRate, sale.items[0].priceUSD], ["FC", undefined, undefined]);
   assert.deepEqual([sale.total, sale.costOfGoodsSold, sale.grossProfit, sale.clothesShareholderProfit], [10, 10, 0, 0]);
   assert.equal((await Product.findById(product._id)).stock, 9);
   const updatedCustomer = await Customer.findById(customer._id).lean();
@@ -124,16 +123,17 @@ itest("a one-item SHOES family discount still splits actual profit 50/50", async
   assert.ok(!sale.clothesShareholderProfit);
 });
 
-itest("an FC-entered family discount keeps its exact FC snapshot", async () => {
+itest("a family discount in francs keeps its exact FC amounts", async () => {
   const customer = await Customer.create({ name: "Famille FC", phone: "0991000007", isFamilyMember: true });
-  const product = await ctx.product("CLOTHES", 10000 / 2850, 20000 / 2850, 10);
+  const product = await ctx.product("CLOTHES", 10000, 20000, 10);
   const body = await familyBody(product, customer, {
-    items: [{ productId: String(product._id), quantity: 1, price: 18000 / 2850, enteredPrice: 18000, enteredCurrency: "FC", exchangeRate: 2850 }],
+    items: [{ productId: String(product._id), quantity: 1, price: 18000, enteredPrice: 18000, enteredCurrency: "FC" }],
   });
   const response = await postSale("superadmin", body);
   assert.equal(response.status, 201, JSON.stringify(response.body));
   const sale = await Sale.findById(response.body._id).lean();
-  assert.deepEqual([sale.items[0].enteredPrice, sale.items[0].priceFC, sale.items[0].revenueFC, sale.items[0].exchangeRate], [18000, 18000, 18000, 2850]);
+  assert.deepEqual([sale.items[0].enteredPrice, sale.items[0].priceFC, sale.items[0].revenueFC, sale.items[0].exchangeRate], [18000, 18000, 18000, undefined]);
+  assert.deepEqual([sale.total, sale.totalRevenueFC, sale.grossProfit], [18000, 18000, 8000]);
   assert.equal(sale.items[0].discountApplied, true);
 });
 

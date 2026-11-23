@@ -133,7 +133,7 @@ router.post("/:id/recalculate", canManageCustomers, async (req, res) => {
     const sales = await Sale.find({ 
       customerId: customerId,
       status: { $in: ["completed", "pending", undefined] } // Include completed, pending, or sales without status
-    }).sort({ createdAt: 1 });
+    }).sort({ createdAt: 1 }).lean(); // lean: totals are read in FC (utils/currency.js)
     
     // FIX: Also filter out voided sales manually for safety
     const validSales = sales.filter(sale => 

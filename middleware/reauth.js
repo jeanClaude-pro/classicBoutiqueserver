@@ -1,16 +1,17 @@
 const jwt = require("jsonwebtoken");
 const { JWT_ALGORITHM } = require("../utils/generateToken");
 const { isSuperadmin } = require("./authorization");
+const { REAUTH_COOKIE, readCookie } = require("../utils/sessionCookies");
 
 // Step-up confirmation for the most sensitive screens (full financial
 // reports). After the superadmin re-enters the password, POST /api/auth/reauth
 // issues a short-lived proof bound to that exact session (its jti). The
 // reports API refuses a superadmin request without a valid proof, so the
 // password screen can no longer be skipped by editing the page in a browser.
+// The proof is an httpOnly cookie: page scripts never see it.
 const REAUTH_PURPOSE = "reports";
 const REAUTH_AUDIENCE = "classic-boutique:reauth";
 const REAUTH_TTL_SECONDS = 15 * 60;
-const REAUTH_HEADER = "X-Reauth-Token";
 
 function issueReauthToken(user, auth) {
   const token = jwt.sign(
@@ -18,11 +19,12 @@ function issueReauthToken(user, auth) {
     process.env.JWT_SECRET,
     { algorithm: JWT_ALGORITHM, audience: REAUTH_AUDIENCE, expiresIn: REAUTH_TTL_SECONDS },
   );
-  return { reauthToken: token, expiresAt: new Date(Date.now() + REAUTH_TTL_SECONDS * 1000).toISOString() };
+  const expiresAtMs = Date.now() + REAUTH_TTL_SECONDS * 1000;
+  return { reauthToken: token, expiresAtMs, expiresAt: new Date(expiresAtMs).toISOString() };
 }
 
 function hasValidReauth(req) {
-  const raw = req.get(REAUTH_HEADER);
+  const raw = readCookie(req, REAUTH_COOKIE);
   if (!raw || raw.length > 2048) return false;
   try {
     const proof = jwt.verify(raw, process.env.JWT_SECRET, { algorithms: [JWT_ALGORITHM], audience: REAUTH_AUDIENCE });
@@ -43,7 +45,6 @@ function requireReportsReauth(req, res, next) {
 }
 
 module.exports = {
-  REAUTH_HEADER,
   REAUTH_TTL_SECONDS,
   hasValidReauth,
   issueReauthToken,

@@ -13,7 +13,10 @@ const EXPENSE_TYPES = Object.freeze({
 // now; only a BALANCE can say how much money is still available to spend.
 const BASIS = Object.freeze({ PERIOD: "PERIOD", BALANCE: "BALANCE" });
 
-// All accounting arithmetic happens in integer cents. Math.round(x) is
+// The accounting currency is the Congolese franc (FC): Sale and Expense
+// aggregations are presented in FC by their model hooks (utils/currency.js),
+// historical records through their own FC snapshots.
+// All accounting arithmetic happens in integer hundredths of a franc. Math.round(x) is
 // floor(x + 0.5), and the Mongo expression below reproduces it exactly so the
 // database and JavaScript always round an amount to the same cent.
 const cents = (value) => Math.round(Number(value || 0) * 100);
@@ -155,18 +158,13 @@ function recognizedSaleMatch(category, range) {
 // sale. Shared by category accounting and the products-sold report so both
 // always use the same definition.
 function saleLineAmountExpressions() {
-  const itemRate = { $ifNull: ["$items.exchangeRate", { $ifNull: ["$exchangeRate", 0] }] };
-  const revenueUSD = { $ifNull: ["$items.revenue", { $multiply: [{ $ifNull: ["$items.priceUSD", "$items.price"] }, "$items.quantity"] }] };
-  const cogsUSD = { $ifNull: ["$items.costOfGoodsSold", 0] };
-  // Legacy lines without revenueFC use their exact FC unit snapshot before
-  // converting the cent-rounded USD revenue (20,000 FC must not become 20,007).
-  const unitPriceFC = { $cond: [{ $eq: ["$items.enteredCurrency", "FC"] }, "$items.enteredPrice", "$items.priceFC"] };
-  const legacyRevenueFC = { $ifNull: [{ $multiply: [unitPriceFC, "$items.quantity"] }, { $multiply: [revenueUSD, itemRate] }] };
+  const revenue = { $ifNull: ["$items.revenue", { $multiply: [{ $ifNull: ["$items.price", 0] }, "$items.quantity"] }] };
+  const cogs = { $ifNull: ["$items.costOfGoodsSold", 0] };
   return {
-    revenueCents: centsExpr(revenueUSD),
-    cogsCents: centsExpr(cogsUSD),
-    revenueFC: { $ifNull: ["$items.revenueFC", legacyRevenueFC] },
-    cogsFC: { $ifNull: ["$items.costOfGoodsSoldFC", { $multiply: [cogsUSD, itemRate] }] },
+    revenue,
+    cogs,
+    revenueCents: centsExpr(revenue),
+    cogsCents: centsExpr(cogs),
   };
 }
 
@@ -181,15 +179,11 @@ function saleTotalsPipeline(category, range) {
       cogsCents: line.cogsCents,
       storedGrossCents: centsExpr("$items.grossProfit"),
       quantity: "$items.quantity",
-      revenueFC: line.revenueFC,
-      cogsFC: line.cogsFC,
     } },
     { $group: {
       _id: null,
       revenueCents: { $sum: "$revenueCents" },
       cogsCents: { $sum: "$cogsCents" },
-      revenueFC: { $sum: "$revenueFC" },
-      cogsFC: { $sum: "$cogsFC" },
       lines: { $sum: 1 },
       unitsSold: { $sum: "$quantity" },
       // Gross profit is always revenue - COGS; a stored snapshot that
@@ -211,18 +205,14 @@ function expenseTotalsPipeline(category, range) {
     { $match: match },
     { $group: {
       _id: "$expenseType",
-      amountCents: { $sum: signed(centsExpr({ $ifNull: ["$amountUSD", "$amount"] })) },
+      amountCents: { $sum: signed(centsExpr({ $ifNull: ["$amount", 0] })) },
       capitalUsedCents: { $sum: signed(centsExpr({ $ifNull: ["$financialSnapshot.capitalUsed", 0] })) },
       profitUsedCents: { $sum: signed(centsExpr({ $ifNull: ["$financialSnapshot.profitUsed", 0] })) },
-      amountFC: { $sum: signed({ $ifNull: ["$amountFC", 0] }) },
-      profitUsedFC: { $sum: signed({ $ifNull: ["$financialSnapshot.profitUsedFC", 0] }) },
       count: { $sum: 1 },
       reversals: { $sum: { $cond: [{ $eq: ["$transactionKind", "REVERSAL"] }, 1, 0] } },
     } },
   ];
 }
-
-const fc = (value) => Number(Number(value || 0).toFixed(2));
 
 /**
  * Authoritative category accounting from immutable Sale and Expense
@@ -256,28 +246,9 @@ async function aggregateCategoryAccounting(category, { session = null, range = n
     capitalUsedForPurchases: money(goods.capitalUsedCents || 0),
     profitUsedForPurchases: money(goods.profitUsedCents || 0),
   }, { basis });
-  // FC figures are informational: historical-rate sums run through the same
-  // formula. USD cents remain the authoritative accounting currency.
-  const accountingFC = calculateCategoryAccounting({
-    category,
-    revenue: fc(sales.revenueFC),
-    costOfGoodsSold: fc(sales.cogsFC),
-    companyExpenses: fc(company.amountFC),
-    goodsPurchases: fc(goods.amountFC),
-    profitUsedForPurchases: category === "CLOTHES" ? fc(goods.profitUsedFC) : undefined,
-  }, { basis });
   return {
     ...accounting,
-    revenueFC: accountingFC.revenue,
-    costOfGoodsSoldFC: accountingFC.costOfGoodsSold,
-    grossProfitFC: accountingFC.grossProfit,
-    companyExpensesFC: accountingFC.companyExpenses,
-    netProfitFC: accountingFC.netProfit,
-    goodsPurchasesFC: accountingFC.goodsPurchases,
-    profitUsedForPurchasesFC: accountingFC.profitUsedForPurchases,
-    distributableProfitFC: accountingFC.distributableProfit,
-    shareholder1FC: accountingFC.shareholder1,
-    shareholder2FC: accountingFC.shareholder2,
+    currency: "FC",
     activity: {
       saleLines: sales.lines || 0,
       unitsSold: sales.unitsSold || 0,
@@ -348,7 +319,7 @@ function purchaseSnapshot(accounting, requestedAmount) {
   }
   const requestedCents = cents(requestedAmount);
   if (requestedCents <= 0) {
-    throw Object.assign(new Error("Purchase amount must be at least 0.01 USD"), { status: 400 });
+    throw Object.assign(new Error("Purchase amount must be greater than 0 FC"), { status: 400 });
   }
   const availableCents = cents(accounting.availablePurchaseFunds);
   if (requestedCents > availableCents) {
@@ -374,6 +345,8 @@ function purchaseSnapshot(accounting, requestedAmount) {
       availableBefore: accounting.availablePurchaseFunds,
       capitalUsed: money(capitalUsedCents),
       profitUsed: money(profitUsedCents),
+      capitalUsedFC: money(capitalUsedCents),
+      profitUsedFC: money(profitUsedCents),
       availableAfter: money(availableCents - requestedCents),
       calculatedAt: new Date(),
     },

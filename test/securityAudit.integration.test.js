@@ -4,7 +4,7 @@ const assert = require("node:assert/strict");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const { SKIP, createIntegrationContext } = require("./helpers/integrationContext");
-const { createUser } = require("./helpers/testApp");
+const { createUser, sessionTokenFrom } = require("./helpers/testApp");
 const User = require("../models/User");
 const Sale = require("../models/Sale");
 const Product = require("../models/Product");
@@ -29,7 +29,11 @@ async function userWithPassword(role = "manager", extra = {}) {
   const user = await User.create({ username: `login${emailCounter}`, email, password: await bcrypt.hash(PASSWORD, 4), role, ...extra });
   return { user, email };
 }
-const login = (email, password = PASSWORD) => ctx.request("POST", "/auth/login", { body: { email, password } });
+// The session comes back as an httpOnly cookie, never in the body.
+const login = async (email, password = PASSWORD) => {
+  const response = await ctx.request("POST", "/auth/login", { body: { email, password } });
+  return { ...response, token: sessionTokenFrom(response) };
+};
 
 // ---------- Authentication ----------
 
@@ -60,41 +64,85 @@ itest("a deactivated account's token is refused with 401", async () => {
 
 itest("a token issued before a role change is revoked", async () => {
   const { user, email } = await userWithPassword("manager");
-  const { token } = (await login(email)).body;
+  const { token } = await login(email);
   assert.equal((await ctx.request("GET", "/sales", { token })).status, 200);
   const change = await ctx.request("PUT", `/users/${user._id}/role`, { token: ctx.token("superadmin"), body: { role: "cashier_supervisor" } });
   assert.equal(change.status, 200);
   const old = await ctx.request("GET", "/sales", { token });
   assert.equal(old.status, 401);
   assert.equal(old.body.code, "SESSION_REVOKED");
-  const fresh = (await login(email)).body;
-  assert.equal(fresh.user.role, "cashier_supervisor");
+  const fresh = await login(email);
+  assert.equal(fresh.body.user.role, "cashier_supervisor");
   assert.equal((await ctx.request("GET", "/sales", { token: fresh.token })).status, 200);
 });
 
 itest("logout ends the session server-side", async () => {
   const { email } = await userWithPassword("manager");
-  const { token } = (await login(email)).body;
+  const { token } = await login(email);
   assert.equal((await ctx.request("GET", "/users/me", { token })).status, 200);
-  assert.equal((await ctx.request("POST", "/auth/logout", { token })).status, 200);
+  const logout = await ctx.request("POST", "/auth/logout", { token });
+  assert.equal(logout.status, 200);
+  assert.ok(logout.setCookies.some((cookie) => /^cb_session=;/.test(cookie)), "the session cookie is erased");
   assert.equal((await ctx.request("GET", "/users/me", { token })).status, 401);
   // Another session of the same account is unaffected.
-  const other = (await login(email)).body.token;
+  const other = (await login(email)).token;
   assert.equal((await ctx.request("GET", "/users/me", { token: other })).status, 200);
 });
 
-itest("public registration creates an inactive staff account without a token", async () => {
-  const email = `signup-${Date.now()}@test.local`;
-  const response = await ctx.request("POST", "/auth/register", { body: { username: "New", email, password: PASSWORD, role: "superadmin", isActive: true } });
-  assert.equal(response.status, 201);
-  assert.equal(response.body.token, undefined);
-  assert.equal(response.body.pendingActivation, true);
-  const stored = await User.findOne({ email }).lean();
-  assert.equal(stored.role, "staff");
-  assert.equal(stored.isActive, false);
-  const attempt = await login(email);
-  assert.equal(attempt.status, 403);
-  assert.equal(attempt.body.token, undefined);
+itest("the session is an httpOnly cookie and never part of a response body", async () => {
+  const { email } = await userWithPassword("manager");
+  const response = await login(email);
+  assert.equal(response.status, 200);
+  assert.equal(response.body.token, undefined, "no token in the body");
+  assert.ok(response.body.expiresAt);
+  const cookie = response.setCookies.find((value) => value.startsWith("cb_session="));
+  assert.ok(cookie, "session cookie set");
+  assert.match(cookie, /HttpOnly/i);
+  assert.match(cookie, /SameSite=Strict/i);
+  assert.match(cookie, /Path=\/api/i);
+  // A Bearer header (the old scheme) is no longer accepted.
+  const bearer = await ctx.request("GET", "/sales", { headers: { Authorization: `Bearer ${response.token}` } });
+  assert.equal(bearer.status, 401);
+});
+
+itest("a new login revokes the session the same browser still carried", async () => {
+  const { email } = await userWithPassword("manager");
+  const first = await login(email);
+  // Signed out while offline: the old cookie is still in the browser.
+  const second = await ctx.request("POST", "/auth/login", { token: first.token, body: { email, password: PASSWORD } });
+  assert.equal(second.status, 200);
+  assert.equal((await ctx.request("GET", "/users/me", { token: first.token })).status, 401, "old session revoked");
+});
+
+itest("there is no public sign-up: only a superadmin creates accounts", async () => {
+  const email = `created-${Date.now()}@test.local`;
+  assert.equal((await ctx.request("POST", "/auth/register", { body: { username: "New", email, password: PASSWORD } })).status, 404);
+  assert.equal(await User.countDocuments({ email }), 0);
+
+  const account = { username: "Nouvelle caissière", email, password: PASSWORD, role: "staff", permissions: ["/", "/sales", "/not-a-module"] };
+  assert.equal((await ctx.request("POST", "/users", { body: account })).status, 401, "anonymous");
+  assert.equal((await ctx.request("POST", "/users", { token: ctx.token("manager"), body: account })).status, 403, "not a superadmin");
+  assert.equal((await ctx.request("POST", "/users", { token: ctx.token("superadmin"), body: { ...account, password: "short" } })).status, 400);
+  assert.equal((await ctx.request("POST", "/users", { token: ctx.token("superadmin"), body: { ...account, role: "admin" } })).status, 400, "a shareholder needs a category");
+
+  const created = await ctx.request("POST", "/users", { token: ctx.token("superadmin"), body: account });
+  assert.equal(created.status, 201, JSON.stringify(created.body));
+  assert.equal(created.body.password, undefined);
+  assert.equal(created.body.isActive, true);
+  assert.deepEqual(created.body.permissions, ["/", "/sales"], "unknown modules are dropped");
+  assert.equal((await ctx.request("POST", "/users", { token: ctx.token("superadmin"), body: account })).status, 409, "duplicate email");
+  assert.equal((await login(email)).status, 200, "the new account can sign in");
+  assert.ok(await AuditLog.exists({ action: "USER_CREATED", targetId: String(created.body._id) }));
+});
+
+itest("only the shop's own site may call the API", async () => {
+  const { email } = await userWithPassword("manager");
+  // A state-changing request without Origin (a script) or from another site is refused.
+  assert.equal((await ctx.request("POST", "/auth/login", { body: { email, password: PASSWORD }, origin: null })).status, 403);
+  assert.equal((await ctx.request("POST", "/auth/login", { body: { email, password: PASSWORD }, origin: "https://evil.example" })).status, 403);
+  assert.equal((await ctx.request("GET", "/sales", { token: ctx.token("staff"), origin: "https://evil.example" })).status, 403);
+  assert.equal((await ctx.request("GET", "/sales", { token: ctx.token("staff"), headers: { "Sec-Fetch-Site": "cross-site" } })).status, 403);
+  assert.equal((await ctx.request("GET", "/sales", { token: ctx.token("staff") })).status, 200);
 });
 
 // ---------- Authorization ----------

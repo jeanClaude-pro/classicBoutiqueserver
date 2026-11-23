@@ -17,7 +17,6 @@ const MODULE_ROLES = Object.freeze({
   "/sortie": ["superadmin", "cashier_supervisor", "inventory_manager", "manager"],
   "/entryhistory": ["superadmin", "cashier_supervisor", "inventory_manager", "manager"],
   "/sortiehistory": ["superadmin", "cashier_supervisor", "inventory_manager", "manager"],
-  "/rate": ["superadmin"],
   "/remboursements": ["superadmin"],
   "/reports": ["superadmin", "admin"],
   "/customers": ["superadmin", "manager", "cashier_supervisor"],

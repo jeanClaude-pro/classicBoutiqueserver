@@ -4,11 +4,12 @@ process.env.JWT_SECRET = process.env.JWT_SECRET || "unit-test-secret-that-is-lon
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const jwt = require("jsonwebtoken");
-const { REAUTH_HEADER, hasValidReauth, issueReauthToken, requireReportsReauth } = require("../middleware/reauth");
+const { hasValidReauth, issueReauthToken, requireReportsReauth } = require("../middleware/reauth");
 const { developmentOnly } = require("../middleware/security");
 
 const user = (role = "superadmin", tokenVersion = 0) => ({ _id: "64b000000000000000000001", role, tokenVersion });
-const request = (u, jti, proof) => ({ user: u, auth: { jti }, get: (name) => (name === REAUTH_HEADER ? proof : undefined) });
+// The proof travels in the httpOnly cb_reauth cookie.
+const request = (u, jti, proof) => ({ user: u, auth: { jti }, headers: proof ? { cookie: `cb_reauth=${encodeURIComponent(proof)}` } : {} });
 function response() {
   return { statusCode: 200, body: null, status(code) { this.statusCode = code; return this; }, json(body) { this.body = body; return this; } };
 }

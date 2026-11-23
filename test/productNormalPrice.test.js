@@ -1,30 +1,22 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { productNormalPrice, productPriceAuthority } = require("../utils/salePricing");
+const { productNormalPrice } = require("../utils/salePricing");
 const { createDiscountProbeGuard } = require("../utils/discountProbeGuard");
 
-const fcProduct = { price: 20000 / 2850, priceEnteredAmount: 20000, priceEnteredCurrency: "FC", priceFC: 20000, priceExchangeRate: 2850 };
-const usdProduct = { price: 20, priceEnteredAmount: 20, priceEnteredCurrency: "USD", priceFC: 57000, priceExchangeRate: 2850 };
-
-test("an FC-defined price keeps its exact FC amount at any rate; only USD follows", () => {
-  assert.deepEqual(productNormalPrice(fcProduct, 2850), { currency: "FC", fc: 20000, usd: 20000 / 2850 });
-  assert.deepEqual(productNormalPrice(fcProduct, 2900), { currency: "FC", fc: 20000, usd: 20000 / 2900 });
-  assert.notEqual(productNormalPrice(fcProduct, 2900).fc, Math.round(fcProduct.price * 2900), "never 20,351 FC");
-  // Without a rate the stored USD value is the only USD figure available.
-  assert.deepEqual(productNormalPrice(fcProduct, undefined), { currency: "FC", fc: 20000, usd: fcProduct.price });
+// Since the FC-only cutover the normal price is the product's FC price.
+test("an FC product's normal price is its exact FC price", () => {
+  assert.deepEqual(productNormalPrice({ currency: "FC", price: 20000, priceFC: 20000 }), { currency: "FC", fc: 20000 });
 });
 
-test("a USD-defined price keeps its exact USD amount; FC follows the rate", () => {
-  assert.deepEqual(productNormalPrice(usdProduct, 2900), { currency: "USD", usd: 20, fc: 58000 });
-  assert.deepEqual(productNormalPrice(usdProduct, 2950), { currency: "USD", usd: 20, fc: 59000 });
-  assert.deepEqual(productNormalPrice(usdProduct, undefined), { currency: "USD", usd: 20, fc: undefined });
-});
-
-test("legacy and malformed products fall back to their USD price", () => {
-  assert.deepEqual(productPriceAuthority({ price: 30 }), { currency: "USD", amount: 30 });
-  assert.deepEqual(productPriceAuthority({ price: 7, priceEnteredCurrency: "FC" }), { currency: "USD", amount: 7 });
-  // A priceFC without priceEnteredAmount (older FC record) is still exact.
-  assert.deepEqual(productPriceAuthority({ price: 7, priceEnteredCurrency: "FC", priceFC: 20000 }), { currency: "FC", amount: 20000 });
+test("a pre-cutover product is read in FC through its own FC snapshot, never a new rate", () => {
+  // Defined in FC: the entered FC amount stays exact.
+  const fcDefined = { price: 20000 / 2850, priceEnteredAmount: 20000, priceEnteredCurrency: "FC", priceFC: 20000, priceExchangeRate: 2850 };
+  assert.equal(productNormalPrice(fcDefined).fc, 20000);
+  // Defined in USD: its FC snapshot, else its USD price at its own stored rate.
+  assert.equal(productNormalPrice({ price: 20, priceEnteredCurrency: "USD", priceFC: 57000, priceExchangeRate: 2850 }).fc, 57000);
+  assert.equal(productNormalPrice({ price: 20, priceExchangeRate: 2900 }).fc, 58000);
+  // No FC information at all: no invented price.
+  assert.equal(productNormalPrice({ price: 30 }).fc, undefined);
 });
 
 test("the discount probe guard limits a user after repeated refusals, for one window only", () => {

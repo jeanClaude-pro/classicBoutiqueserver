@@ -8,7 +8,6 @@ const { SKIP, createIntegrationContext, cents } = require("./helpers/integration
 const Sale = require("../models/Sale");
 const Expense = require("../models/Expense");
 const Product = require("../models/Product");
-const ExchangeRate = require("../models/ExchangeRate");
 const { aggregateCategoryAccounting } = require("../services/financialAccountingService");
 const { businessDateStart, businessDateEnd } = require("../utils/queryHelpers");
 
@@ -299,25 +298,34 @@ itest("12, 26. validated purchases and expenses are reversed by auditable counte
   assert.equal(await Expense.countDocuments(), 4, "originals and reversals are all preserved");
 });
 
-itest("28-29. FC transactions keep their historical snapshot when today's rate changes", async () => {
-  const shoes = await ctx.product("SHOES", 60, 100);
-  const fcSale = await ctx.sell([{ product: shoes, quantity: 2, enteredCurrency: "FC", enteredPrice: 285000 }], { exchangeRate: 2850 });
-  assert.equal(fcSale.status, 201, JSON.stringify(fcSale.body));
-  const purchase = await ctx.expense({ expenseType: "GOODS_PURCHASE", category: "SHOES", amount: 10000, enteredCurrency: "FC", exchangeRate: 2850 });
+itest("28-29. a cash-out recorded in dollars before the FC cutover is counted in FC at its own rate and never rewritten", async () => {
+  const shoes = await ctx.product("SHOES", 60000, 100000);
+  const sale = await ctx.sell([{ product: shoes, quantity: 2 }]);
+  assert.equal(sale.status, 201, JSON.stringify(sale.body));
+  const purchase = await ctx.expense({ expenseType: "GOODS_PURCHASE", category: "SHOES", amount: 10000 });
   assert.equal(purchase.status, 201, JSON.stringify(purchase.body));
+  assert.deepEqual([purchase.body.currency, purchase.body.amount, purchase.body.amountUSD, purchase.body.exchangeRate], ["FC", 10000, undefined, undefined]);
   const before = await ctx.balance("SHOES");
   assertIdentities(before);
-  assert.equal(before.revenue, 200);
-  assert.equal(before.revenueFC, 570000);
-  assert.equal(before.goodsPurchases, 3.51, "10,000 FC / 2,850 rounded once to the cent");
-  assert.equal(purchase.body.financialSnapshot.capitalUsed, 3.51);
+  assert.deepEqual([before.revenue, before.costOfGoodsSold, before.goodsPurchases, before.capitalUsedForPurchases], [200000, 120000, 10000, 10000]);
 
-  await ExchangeRate.create({ rate: 3500, createdBy: ctx.users.superadmin.user._id, isActive: true, effectiveFrom: new Date() });
+  // The same purchase as the pre-cutover version recorded it: 10,000 FC
+  // entered, $3.51 booked at 2,850 FC/USD, no currency marker.
+  await Expense.collection.updateOne({ _id: new mongoose.Types.ObjectId(String(purchase.body._id)) }, {
+    $set: { amount: 3.51, amountUSD: 10000 / 2850, exchangeRate: 2850, enteredAmount: 10000, enteredCurrency: "FC", "financialSnapshot.capitalUsed": 3.51, "financialSnapshot.profitUsed": 0 },
+    $unset: { currency: 1, amountFC: 1, "financialSnapshot.capitalUsedFC": 1, "financialSnapshot.profitUsedFC": 1 },
+  });
+  const raw = await Expense.collection.findOne({ _id: new mongoose.Types.ObjectId(String(purchase.body._id)) });
+
   const after = await ctx.balance("SHOES");
-  assert.deepEqual(after, { ...before, range: null }, "a new current rate changes nothing historical");
-  const stored = await Expense.findById(purchase.body._id).lean();
-  assert.deepEqual([stored.enteredAmount, stored.enteredCurrency, stored.amountFC, stored.exchangeRate], [10000, "FC", 10000, 2850]);
-  assert.equal(stored.amountUSD, 10000 / 2850);
+  assert.deepEqual(after, { ...before, range: null }, "the legacy record counts as the 10,000 FC that was entered");
+  const shown = await ctx.request("GET", `/expenses/${purchase.body._id}`, { token: ctx.token("superadmin") });
+  assert.equal(shown.status, 200, JSON.stringify(shown.body));
+  const shownExpense = shown.body.data ?? shown.body;
+  assert.deepEqual([shownExpense.currency, shownExpense.amount, shownExpense.amountUSD, shownExpense.exchangeRate], ["FC", 10000, undefined, undefined]);
+
+  // Reading it changed nothing: history is never rewritten.
+  assert.deepEqual(await Expense.collection.findOne({ _id: raw._id }), raw);
 });
 
 itest("30-32. mixed sales split per line; categories and shareholders stay isolated", async () => {
@@ -361,7 +369,7 @@ itest("33. legacy cash-outs stay in cash history but never touch category accoun
   const shoes = await ctx.product("SHOES", 60, 100);
   await ctx.sell([{ product: shoes, quantity: 10 }]);
   const legacy = await Expense.create({
-    expenseId: "LEG-1", reason: "ancienne sortie", recipientName: "x", recipientPhone: "1", amount: 50, amountUSD: 50,
+    expenseId: "LEG-1", reason: "ancienne sortie", recipientName: "x", recipientPhone: "1", amount: 50, amountUSD: 50, exchangeRate: 2850,
     recordedBy: "legacy", status: "validated", validatedAt: new Date(), expenseType: "LEGACY_UNCLASSIFIED",
   });
   const pendingLegacy = await Expense.create({
@@ -371,7 +379,7 @@ itest("33. legacy cash-outs stay in cash history but never touch category accoun
   const s = await ctx.balance("SHOES");
   assert.deepEqual([s.companyExpenses, s.netProfit, s.availablePurchaseFunds], [0, 400, 600]);
   const data = await summary({ date: TODAY });
-  assert.equal(data.totalValidatedExpenses, 50, "still part of global cash reporting");
+  assert.equal(data.totalValidatedExpenses, 142500, "still part of global cash reporting, in FC at its own rate ($50 x 2,850)");
   assert.equal(data.totalCompanyExpenses, 0);
   assert.equal((await ctx.validate(pendingLegacy._id)).status, 409, "legacy records are never auto-classified");
   assert.equal((await ctx.request("DELETE", `/expenses/${legacy._id}/admin`, { token: ctx.token("superadmin") })).status, 409);
@@ -437,7 +445,7 @@ itest("32. final reconciliation: realistic multi-product scenario across both ca
   await ctx.sell([{ product: dress, quantity: 12 }, { product: heels, quantity: 3 }]);
   await ctx.sell([{ product: shirt, quantity: 30 }], { paymentMethod: "card" });
   await ctx.sell([{ product: sneakers, quantity: 7 }, { product: shirt, quantity: 2 }], { paymentMethod: "transfer" });
-  await ctx.sell([{ product: dress, quantity: 3, enteredCurrency: "FC", enteredPrice: 114000 }], { exchangeRate: 2850 });
+  await ctx.sell([{ product: dress, quantity: 3, enteredCurrency: "FC", enteredPrice: 40 }]);
   const voided = await ctx.sell([{ product: heels, quantity: 1 }]);
   await ctx.request("PATCH", `/sales/${voided.body._id}/void`, { token: ctx.token("superadmin"), body: {} });
   const pendingReservation = await ctx.sell([{ product: sneakers, quantity: 2 }], { type: "reservation" });
@@ -446,7 +454,7 @@ itest("32. final reconciliation: realistic multi-product scenario across both ca
   // CLOTHES: revenue 12*40 + 32*19.99 + 3*40 = 1239.68; COGS 300 + 336 + 75 = 711.
   await ctx.expense({ expenseType: "COMPANY_EXPENSE", category: "CLOTHES", amount: 120.5 });
   const clothesCapitalPurchase = await ctx.expense({ expenseType: "GOODS_PURCHASE", category: "CLOTHES", amount: 500 });
-  const clothesMixedPurchase = await ctx.expense({ expenseType: "GOODS_PURCHASE", category: "CLOTHES", amount: 713160, enteredCurrency: "FC", exchangeRate: 2850 });
+  const clothesMixedPurchase = await ctx.expense({ expenseType: "GOODS_PURCHASE", category: "CLOTHES", amount: 250.23, enteredCurrency: "FC" });
   assert.equal(clothesCapitalPurchase.body.fundingSource, "RECOVERED_CAPITAL");
   assert.equal(clothesMixedPurchase.body.fundingSource, "MIXED");
   assert.deepEqual([clothesMixedPurchase.body.financialSnapshot.capitalUsed, clothesMixedPurchase.body.financialSnapshot.profitUsed], [211, 39.23]);

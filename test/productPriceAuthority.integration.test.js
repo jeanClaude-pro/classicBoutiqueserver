@@ -1,7 +1,7 @@
-// The currency in which a Product's normal selling price was defined is
-// authoritative. A rate change only converts the other currency for NEW
-// transactions; the Product's authoritative amount and every recorded sale
-// snapshot stay exactly as they were.
+// The Product's selling price is authoritative, and since the FC-only cutover
+// it is a price in Congolese francs (FC): there is no second currency and no
+// exchange rate. A product recorded before the cutover keeps its own FC
+// snapshot until it is next saved; recorded sales keep their amounts.
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { SKIP, createIntegrationContext } = require("./helpers/integrationContext");
@@ -16,255 +16,187 @@ test.beforeEach(ctx.reset);
 const itest = (name, fn) => test(name, { skip: SKIP }, fn);
 
 // Created through the real Product API, as the Products page does.
-async function createProduct({ price, currency, unitCost, costCurrency = currency, rate, stock = 100, mainCategory = "CLOTHES" }) {
-  await ctx.setRate(rate);
+async function createProduct({ price, unitCost, stock = 100, mainCategory = "CLOTHES" }) {
   const response = await ctx.request("POST", "/products", {
     token: ctx.token("superadmin"),
     body: {
-      name: `${currency}-${price}`, mainCategory, subcategory: "Robes", purchasedQuantity: stock, stock,
-      priceEnteredAmount: price, priceEnteredCurrency: currency, priceExchangeRate: rate,
-      unitCostEnteredAmount: unitCost, unitCostEnteredCurrency: costCurrency, unitCostExchangeRate: rate,
+      name: `Produit-${price}-${unitCost}`, mainCategory, subcategory: "Robes", purchasedQuantity: stock, stock,
+      priceEnteredAmount: price, priceEnteredCurrency: "FC",
+      unitCostEnteredAmount: unitCost, unitCostEnteredCurrency: "FC",
     },
   });
   assert.equal(response.status, 201, JSON.stringify(response.body));
   return Product.findById(response.body._id).lean();
 }
 
-const fcLine = (product, quantity, enteredPrice) => ({ product, quantity, price: 1, enteredPrice, enteredCurrency: "FC" });
-const usdLine = (product, quantity, enteredPrice) => ({ product, quantity, price: enteredPrice, enteredPrice, enteredCurrency: "USD" });
+const fcLine = (product, quantity, enteredPrice) => ({ product, quantity, enteredPrice, enteredCurrency: "FC" });
 const savedItem = async (response) => (await Sale.findById(response.body._id).lean()).items[0];
 const editProduct = (product, body) => ctx.request("PUT", `/products/${product._id}`, { token: ctx.token("superadmin"), body });
 
-itest("1-5. an FC product (20,000 FC at 2,850) still sells at exactly 20,000 FC after the rate moves to 2,900", async () => {
-  const robe = await createProduct({ price: 20000, currency: "FC", unitCost: 10000, rate: 2850 });
-  assert.deepEqual([robe.priceEnteredAmount, robe.priceEnteredCurrency, robe.priceFC], [20000, "FC", 20000]);
+itest("a product is recorded in FC only and sells at exactly its FC price", async () => {
+  const robe = await createProduct({ price: 20000, unitCost: 10000 });
+  assert.deepEqual(
+    [robe.currency, robe.price, robe.priceFC, robe.priceEnteredAmount, robe.priceEnteredCurrency, robe.priceExchangeRate],
+    ["FC", 20000, 20000, 20000, "FC", undefined],
+  );
+  assert.deepEqual([robe.unitCost, robe.unitCostFC, robe.unitCostExchangeRate, robe.totalAcquisitionCost], [10000, 10000, undefined, 1000000]);
 
-  await ctx.setRate(2900);
-  const stored = await Product.findById(robe._id).lean();
-  assert.deepEqual([stored.priceEnteredAmount, stored.priceFC, stored.priceEnteredCurrency], [20000, 20000, "FC"], "the rate change does not touch the Product");
-
-  // One piece at 20,000 FC: had the normal price become 20,351 FC this would
-  // be a discount and be refused for a cart under 5 pieces.
-  const sale = await ctx.sell([fcLine(robe, 1, 20000)], { exchangeRate: 2900 });
+  const sale = await ctx.sell([fcLine(robe, 1, 20000)]);
   assert.equal(sale.status, 201, JSON.stringify(sale.body));
   const item = await savedItem(sale);
-  assert.deepEqual([item.enteredPrice, item.priceFC, item.exchangeRate], [20000, 20000, 2900]);
-  assert.equal(item.priceUSD, 20000 / 2900);
-  assert.equal(item.unitSellingPrice, 6.9);
+  assert.deepEqual([item.enteredPrice, item.priceFC, item.unitSellingPrice, item.revenue], [20000, 20000, 20000, 20000]);
   assert.deepEqual([item.referenceUnitSellingPriceFC, item.discountApplied, item.discountPerUnitFC], [20000, false, 0]);
-  assert.notEqual(item.referenceUnitSellingPriceFC, 20351);
+  assert.deepEqual([item.unitAcquisitionCost, item.costOfGoodsSold, item.grossProfit], [10000, 10000, 10000]);
+  assert.deepEqual([item.priceUSD, item.exchangeRate], [undefined, undefined]);
 });
 
-itest("6-9. a USD product stays exactly $20; its FC equivalent is 58,000 at 2,900 and 59,000 at 2,950", async () => {
-  const chemise = await createProduct({ price: 20, currency: "USD", unitCost: 8, rate: 2850 });
-  assert.equal(chemise.priceFC, 57000);
-
-  const at2900 = await ctx.sell([usdLine(chemise, 1, 20)], { exchangeRate: 2900 });
-  assert.equal(at2900.status, 201, JSON.stringify(at2900.body));
-  const first = await savedItem(at2900);
-  assert.deepEqual([first.priceUSD, first.priceFC, first.referenceUnitSellingPrice, first.referenceUnitSellingPriceFC, first.discountApplied], [20, 58000, 20, 58000, false]);
-
-  // Its exact FC equivalent is the normal price too, not a discount.
-  const inFC = await ctx.sell([fcLine(chemise, 1, 58000)], { exchangeRate: 2900 });
-  assert.equal(inFC.status, 201, JSON.stringify(inFC.body));
-
-  const at2950 = await ctx.sell([usdLine(chemise, 1, 20)], { exchangeRate: 2950 });
-  assert.equal(at2950.status, 201, JSON.stringify(at2950.body));
-  assert.deepEqual([(await savedItem(at2950)).priceUSD, (await savedItem(at2950)).priceFC], [20, 59000]);
-  assert.equal((await Product.findById(chemise._id).lean()).price, 20, "the Product still says $20");
-});
-
-itest("10-12, 21-23. recorded FC and USD sales keep their snapshots after a rate change and a Product price edit", async () => {
-  const robe = await createProduct({ price: 20000, currency: "FC", unitCost: 10000, rate: 2850 });
-  const chemise = await createProduct({ price: 20, currency: "USD", unitCost: 8, rate: 2850 });
-  const oldFC = await ctx.sell([fcLine(robe, 1, 20000)], { exchangeRate: 2850 });
-  const oldUSD = await ctx.sell([usdLine(chemise, 1, 20)], { exchangeRate: 2850 });
-  assert.equal(oldFC.status, 201);
-  assert.equal(oldUSD.status, 201);
-  const before = await Sale.find().sort({ createdAt: 1 }).lean();
-
-  await ctx.setRate(2900);
-  const edited = await editProduct(robe, { priceEnteredAmount: 22000, priceEnteredCurrency: "FC", priceExchangeRate: 2900 });
-  assert.equal(edited.status, 200, JSON.stringify(edited.body));
-  assert.deepEqual([edited.body.priceEnteredAmount, edited.body.priceFC, edited.body.priceEnteredCurrency], [22000, 22000, "FC"]);
-
-  // The future: the new authoritative 22,000 FC is the normal price.
-  const next = await ctx.sell([fcLine(robe, 1, 22000)], { exchangeRate: 2900 });
-  assert.equal(next.status, 201, JSON.stringify(next.body));
-  assert.equal((await savedItem(next)).referenceUnitSellingPriceFC, 22000);
-  const oldPriceNow = await ctx.sell([fcLine(robe, 1, 20000)], { exchangeRate: 2900 });
-  assert.equal(oldPriceNow.body.error, "DISCOUNT_QUANTITY_REQUIRED", "20,000 FC is now a discount");
-
-  // The past: every stored snapshot is unchanged.
-  const after = await Sale.find({ _id: { $in: before.map((sale) => sale._id) } }).sort({ createdAt: 1 }).lean();
-  assert.deepEqual(after.map((sale) => sale.items), before.map((sale) => sale.items));
-  assert.deepEqual(after.map((sale) => [sale.total, sale.totalRevenueFC, sale.exchangeRate]), before.map((sale) => [sale.total, sale.totalRevenueFC, sale.exchangeRate]));
-
-  // Sales History reads the snapshots.
-  const history = await ctx.request("GET", "/sales?type=sale", { token: ctx.token("superadmin") });
-  assert.equal(history.status, 200);
-  const byId = Object.fromEntries(history.body.data.map((sale) => [String(sale._id), sale]));
-  assert.deepEqual([byId[oldFC.body._id].items[0].priceFC, byId[oldFC.body._id].exchangeRate], [20000, 2850]);
-  assert.deepEqual([byId[oldUSD.body._id].items[0].priceUSD, byId[oldUSD.body._id].items[0].priceFC], [20, 57000]);
-  // Reports: revenue in FC is the sum of recorded snapshots (20,000 + 57,000 + 22,000).
-  assert.equal(history.body.summary.revenueFC, 99000);
-  const report = await ctx.request("GET", "/analytics/summary", { token: ctx.token("superadmin") });
-  assert.equal(report.status, 200, JSON.stringify(report.body));
-  assert.equal(report.body.data.categoryBreakdown.CLOTHES.revenueFC, 99000);
-});
-
-itest("13-14. switching the Product price FC -> USD and USD -> FC makes the new currency authoritative", async () => {
-  const robe = await createProduct({ price: 20000, currency: "FC", unitCost: 10000, rate: 2850 });
-  await ctx.setRate(2900);
-  const toUSD = await editProduct(robe, { priceEnteredAmount: 7.59, priceEnteredCurrency: "USD", priceExchangeRate: 2900 });
-  assert.equal(toUSD.status, 200, JSON.stringify(toUSD.body));
-  assert.deepEqual([toUSD.body.priceEnteredCurrency, toUSD.body.price], ["USD", 7.59]);
-  const inUSD = await ctx.sell([usdLine(robe, 1, 7.59)], { exchangeRate: 3000 });
-  assert.equal(inUSD.status, 201, JSON.stringify(inUSD.body));
-  assert.deepEqual([(await savedItem(inUSD)).referenceUnitSellingPrice, (await savedItem(inUSD)).referenceUnitSellingPriceFC], [7.59, 22770]);
-
-  const toFC = await editProduct(robe, { priceEnteredAmount: 23000, priceEnteredCurrency: "FC", priceExchangeRate: 3000 });
-  assert.equal(toFC.status, 200, JSON.stringify(toFC.body));
-  const inFC = await ctx.sell([fcLine(robe, 1, 23000)], { exchangeRate: 3100 });
-  assert.equal(inFC.status, 201, JSON.stringify(inFC.body));
-  const item = await savedItem(inFC);
-  assert.deepEqual([item.priceFC, item.referenceUnitSellingPriceFC, item.discountApplied], [23000, 23000, false]);
-  assert.equal(item.priceUSD, 23000 / 3100);
-});
-
-itest("an edit that resubmits the same price and cost keeps their snapshots instead of re-deriving them at today's rate", async () => {
-  const robe = await createProduct({ price: 20000, currency: "FC", unitCost: 10000, rate: 2850 });
-  await ctx.setRate(2900);
-  const resaved = await editProduct(robe, {
-    name: "Robe renommée", stock: 90,
-    priceEnteredAmount: 20000, priceEnteredCurrency: "FC", priceExchangeRate: 2900,
-    unitCostEnteredAmount: 10000, unitCostEnteredCurrency: "FC", unitCostExchangeRate: 2900,
+itest("the Product API refuses a price or cost entered in dollars and changes nothing", async () => {
+  const before = await Product.countDocuments();
+  const created = await ctx.request("POST", "/products", {
+    token: ctx.token("superadmin"),
+    body: { name: "Chemise $", mainCategory: "CLOTHES", subcategory: "Chemises", purchasedQuantity: 5, stock: 5, priceEnteredAmount: 20, priceEnteredCurrency: "USD", unitCostEnteredAmount: 8, unitCostEnteredCurrency: "FC" },
   });
-  assert.equal(resaved.status, 200, JSON.stringify(resaved.body));
-  const stored = await Product.findById(robe._id).lean();
-  assert.equal(stored.name, "Robe renommée");
-  assert.deepEqual([stored.price, stored.priceExchangeRate, stored.priceFC], [robe.price, 2850, 20000]);
-  assert.deepEqual([stored.unitCost, stored.unitCostExchangeRate, stored.totalAcquisitionCost], [robe.unitCost, 2850, robe.totalAcquisitionCost]);
+  assert.equal(created.status, 400);
+  assert.match(created.body.error, /FC/);
+  assert.equal(await Product.countDocuments(), before);
 
-  // Omitting price and cost entirely (what the edit form now sends) keeps them too.
-  const omitted = await editProduct(robe, { stock: 80 });
-  assert.equal(omitted.status, 200, JSON.stringify(omitted.body));
-  const again = await Product.findById(robe._id).lean();
-  assert.deepEqual([again.priceEnteredAmount, again.priceEnteredCurrency, again.unitCost, again.stock], [20000, "FC", robe.unitCost, 80]);
+  const robe = await createProduct({ price: 20000, unitCost: 10000 });
+  const edited = await editProduct(robe, { unitCostEnteredAmount: 4, unitCostEnteredCurrency: "USD" });
+  assert.equal(edited.status, 400);
+  const stored = await Product.findById(robe._id).lean();
+  assert.deepEqual([stored.price, stored.unitCost], [20000, 10000]);
 });
 
-itest("15, 17-18. an FC product's discount is measured from the exact 20,000 FC at today's rate, with 50% profit protection", async () => {
-  // Cost 10,000 FC at 2,850 = $3.51. Normal price at 2,900 = $6.90.
-  // Half the $3.39 profit must be kept: the floor is $5.21 = 15,109 FC at 2,900.
-  const robe = await createProduct({ price: 20000, currency: "FC", unitCost: 10000, rate: 2850 });
-  const under5 = await ctx.sell([fcLine(robe, 4, 19000)], { exchangeRate: 2900 });
+itest("15-18. a discount is measured from the exact FC price, with 50% profit protection", async () => {
+  // Cost 10,000 FC, normal 20,000 FC: half of the 10,000 FC profit is kept,
+  // so the lowest discounted price is 15,000 FC.
+  const robe = await createProduct({ price: 20000, unitCost: 10000 });
+  const under5 = await ctx.sell([fcLine(robe, 4, 19000)]);
   assert.equal(under5.body.error, "DISCOUNT_QUANTITY_REQUIRED");
 
-  const tooLow = await ctx.sell([fcLine(robe, 5, 15100)], { exchangeRate: 2900 });
+  const tooLow = await ctx.sell([fcLine(robe, 5, 14999)]);
   assert.equal(tooLow.status, 400);
   assert.equal(tooLow.body.error, "PRICE_TOO_LOW");
   assert.equal(tooLow.body.message, "Prix trop bas. Veuillez augmenter le prix.");
-  assert.doesNotMatch(JSON.stringify(tooLow.body), /15109|5\.21|3\.51|unitCost|minimum|floor/);
+  assert.doesNotMatch(JSON.stringify(tooLow.body), /15000|10000|unitCost|minimum|floor/);
 
-  const accepted = await ctx.sell([fcLine(robe, 5, 15200)], { exchangeRate: 2900 });
+  const accepted = await ctx.sell([fcLine(robe, 5, 15000)]);
   assert.equal(accepted.status, 201, JSON.stringify(accepted.body));
   const item = await savedItem(accepted);
-  assert.deepEqual([item.enteredPrice, item.priceFC, item.referenceUnitSellingPriceFC, item.discountPerUnitFC, item.discountApplied], [15200, 15200, 20000, 4800, true]);
-  assert.equal(item.referenceUnitSellingPrice, 6.9);
+  assert.deepEqual([item.enteredPrice, item.priceFC, item.referenceUnitSellingPriceFC, item.discountPerUnitFC, item.discountApplied], [15000, 15000, 20000, 5000, true]);
+  assert.deepEqual([item.revenue, item.costOfGoodsSold, item.grossProfit], [75000, 50000, 25000]);
 });
 
-itest("16-18. a USD product's discount is measured from the exact $20, whatever the rate", async () => {
-  // Cost $8, normal $20: the floor keeps half the $12 profit, i.e. $14.
-  const chemise = await createProduct({ price: 20, currency: "USD", unitCost: 8, rate: 2850 });
-  assert.equal((await ctx.sell([usdLine(chemise, 5, 13.99)], { exchangeRate: 2900 })).body.error, "PRICE_TOO_LOW");
-  assert.equal((await ctx.sell([fcLine(chemise, 5, 40599)], { exchangeRate: 2900 })).body.error, "PRICE_TOO_LOW");
-  const inFC = await ctx.sell([fcLine(chemise, 5, 40600)], { exchangeRate: 2900 });
-  assert.equal(inFC.status, 201, JSON.stringify(inFC.body));
-  assert.deepEqual([(await savedItem(inFC)).referenceUnitSellingPriceFC, (await savedItem(inFC)).discountPerUnitFC], [58000, 17400]);
-  const inUSD = await ctx.sell([usdLine(chemise, 5, 14)], { exchangeRate: 2900 });
-  assert.equal(inUSD.status, 201, JSON.stringify(inUSD.body));
-  assert.deepEqual([(await savedItem(inUSD)).referenceUnitSellingPrice, (await savedItem(inUSD)).discountPerUnit], [20, 6]);
+itest("10-12, 21-23. a price edit is the new normal price; recorded sales keep their amounts", async () => {
+  const robe = await createProduct({ price: 20000, unitCost: 10000 });
+  const old = await ctx.sell([fcLine(robe, 1, 20000)]);
+  assert.equal(old.status, 201);
+  const before = await Sale.find().lean();
+
+  const edited = await editProduct(robe, { priceEnteredAmount: 22000, priceEnteredCurrency: "FC" });
+  assert.equal(edited.status, 200, JSON.stringify(edited.body));
+  assert.deepEqual([edited.body.currency, edited.body.price, edited.body.priceFC, edited.body.priceEnteredAmount], ["FC", 22000, 22000, 22000]);
+
+  const next = await ctx.sell([fcLine(robe, 1, 22000)]);
+  assert.equal(next.status, 201, JSON.stringify(next.body));
+  assert.equal((await savedItem(next)).referenceUnitSellingPriceFC, 22000);
+  const oldPriceNow = await ctx.sell([fcLine(robe, 1, 20000)]);
+  assert.equal(oldPriceNow.body.error, "DISCOUNT_QUANTITY_REQUIRED", "20,000 FC is now a discount");
+
+  const after = await Sale.find({ _id: { $in: before.map((sale) => sale._id) } }).lean();
+  assert.deepEqual(after, before, "the recorded sale is untouched");
+  const history = await ctx.request("GET", "/sales?type=sale", { token: ctx.token("superadmin") });
+  assert.deepEqual([history.body.summary.currency, history.body.summary.revenue], ["FC", 42000]);
 });
 
-itest("19-20. EXCHANGE_RATE_CHANGED: after a refusal the same 20,000 FC and $20 are accepted at the new rate", async () => {
-  const robe = await createProduct({ price: 20000, currency: "FC", unitCost: 10000, rate: 2850 });
-  const chemise = await createProduct({ price: 20, currency: "USD", unitCost: 8, rate: 2850 });
-  await ctx.setRate(2900);
-  const body = (rate) => ({
-    isWalkIn: true, paymentMethod: "cash", exchangeRate: rate,
-    items: [
-      { productId: String(robe._id), quantity: 1, price: 20000 / rate, enteredPrice: 20000, enteredCurrency: "FC", exchangeRate: rate },
-      { productId: String(chemise._id), quantity: 1, price: 20, enteredPrice: 20, enteredCurrency: "USD", exchangeRate: rate },
-    ],
+itest("an edit that omits the price and cost keeps them", async () => {
+  const robe = await createProduct({ price: 20000, unitCost: 10000 });
+  const renamed = await editProduct(robe, { name: "Robe renommée", stock: 90 });
+  assert.equal(renamed.status, 200, JSON.stringify(renamed.body));
+  const stored = await Product.findById(robe._id).lean();
+  assert.deepEqual([stored.name, stored.stock, stored.price, stored.unitCost, stored.totalAcquisitionCost], ["Robe renommée", 90, 20000, 10000, robe.totalAcquisitionCost]);
+});
+
+itest("a product priced in dollars before the cutover sells at its own FC snapshot and becomes FC when next saved", async () => {
+  const robe = await ctx.product("CLOTHES", 10000, 20000, 10);
+  // The record as the pre-cutover version kept it: $7.02 / $3.51 at 2,850 FC/USD,
+  // with the FC amounts that were entered, and no currency marker.
+  await Product.collection.updateOne({ _id: robe._id }, {
+    $set: { price: 7.02, priceExchangeRate: 2850, unitCost: 3.51, unitCostExchangeRate: 2850, totalAcquisitionCost: 35.1 },
+    $unset: { currency: 1, totalAcquisitionCostFC: 1 },
   });
-  const stale = await ctx.request("POST", "/sales", { token: ctx.token("staff"), body: body(2850) });
-  assert.equal(stale.status, 409);
-  assert.deepEqual([stale.body.error, stale.body.exchangeRate], ["EXCHANGE_RATE_CHANGED", 2900]);
-  assert.equal(await Sale.countDocuments(), 0);
 
-  const retried = await ctx.request("POST", "/sales", { token: ctx.token("staff"), body: body(2900) });
-  assert.equal(retried.status, 201, JSON.stringify(retried.body));
-  const items = (await Sale.findById(retried.body._id).lean()).items;
-  assert.deepEqual([items[0].enteredPrice, items[0].priceFC, items[0].discountApplied], [20000, 20000, false]);
-  assert.deepEqual([items[1].priceUSD, items[1].priceFC, items[1].discountApplied], [20, 58000, false]);
+  const listed = await ctx.request("GET", `/products/${robe._id}`, { token: ctx.token("superadmin") });
+  assert.equal(listed.status, 200, JSON.stringify(listed.body));
+  assert.deepEqual([listed.body.currency, listed.body.price, listed.body.unitCost, listed.body.priceExchangeRate], ["FC", 20000, 10000, undefined]);
+
+  const sale = await ctx.sell([fcLine(robe, 1, 20000)]);
+  assert.equal(sale.status, 201, JSON.stringify(sale.body));
+  const item = await savedItem(sale);
+  assert.deepEqual([item.priceFC, item.discountApplied, item.unitAcquisitionCost, item.grossProfit], [20000, false, 10000, 10000]);
+
+  const saved = await editProduct(robe, { name: "Robe convertie" });
+  assert.equal(saved.status, 200, JSON.stringify(saved.body));
+  const stored = await Product.findById(robe._id).lean();
+  assert.deepEqual(
+    [stored.currency, stored.price, stored.priceFC, stored.unitCost, stored.priceExchangeRate, stored.unitCostExchangeRate, stored.stock],
+    ["FC", 20000, 20000, 10000, undefined, undefined, 9],
+  );
 });
 
-itest("inventory retail value prices FC-defined stock at today's rate and USD-defined stock at its USD price", async () => {
-  await createProduct({ price: 20000, currency: "FC", unitCost: 10000, rate: 2850, stock: 10 });
-  await createProduct({ price: 20, currency: "USD", unitCost: 8, rate: 2850, stock: 10 });
-  await ctx.setRate(2900);
+itest("inventory retail value is stock x FC selling price, converted products included", async () => {
+  await createProduct({ price: 20000, unitCost: 10000, stock: 10 });
+  const legacy = await ctx.product("CLOTHES", 10000, 20000, 10);
+  await Product.collection.updateOne({ _id: legacy._id }, { $set: { price: 7.02, priceExchangeRate: 2850 }, $unset: { currency: 1 } });
   const report = await ctx.request("GET", "/analytics/summary", { token: ctx.token("superadmin") });
   assert.equal(report.status, 200, JSON.stringify(report.body));
-  assert.ok(Math.abs(report.body.data.inventoryValuation.CLOTHES.retailValue - (10 * 20000 / 2900 + 10 * 20)) < 1e-9);
+  assert.equal(report.body.data.inventoryValuation.CLOTHES.retailValue, 400000);
 });
 
 itest("price probing: after repeated refusals a reduced price is refused without depending on the floor", async () => {
-  const product = await ctx.product("CLOTHES", 10, 20, 500);
-  await ctx.setRate(2850);
+  const product = await ctx.product("CLOTHES", 10000, 20000, 500);
   for (let attempt = 0; attempt < MAX_REJECTIONS; attempt += 1) {
-    const refused = await ctx.sell([{ product, quantity: 5, price: 14 }]);
+    const refused = await ctx.sell([{ product, quantity: 5, price: 14000 }]);
     assert.equal(refused.body.error, "PRICE_TOO_LOW");
   }
-  // A valid discount ($15 is exactly the floor) and an invalid one get the same answer.
-  for (const price of [15, 11]) {
+  // A valid discount (15,000 FC is exactly the floor) and an invalid one get the same answer.
+  for (const price of [15000, 11000]) {
     const limited = await ctx.sell([{ product, quantity: 5, price }]);
     assert.equal(limited.status, 429);
     assert.equal(limited.body.error, "DISCOUNT_ATTEMPTS_LIMITED");
-    assert.doesNotMatch(JSON.stringify(limited.body), /\b(15|10)\b|unitCost|minimum|floor/);
+    assert.doesNotMatch(JSON.stringify(limited.body), /\b(15000|10000)\b|unitCost|minimum|floor/);
   }
   // Selling at the normal price is never affected, and nothing was written by the refusals.
-  const normal = await ctx.sell([{ product, quantity: 5, price: 20 }]);
+  const normal = await ctx.sell([{ product, quantity: 5, price: 20000 }]);
   assert.equal(normal.status, 201, JSON.stringify(normal.body));
   assert.equal(await Sale.countDocuments(), 1);
-  // Another cashier, and roles that can already see costs, are not limited.
-  assert.equal((await ctx.sell([{ product, quantity: 5, price: 15 }], { role: "manager" })).status, 201);
-  assert.equal((await ctx.sell([{ product, quantity: 5, price: 15 }], { role: "superadmin" })).status, 201);
+  // Roles that can already see costs are not limited.
+  assert.equal((await ctx.sell([{ product, quantity: 5, price: 15000 }], { role: "manager" })).status, 201);
+  assert.equal((await ctx.sell([{ product, quantity: 5, price: 15000 }], { role: "superadmin" })).status, 201);
 });
 
 // Business rule: the POS sells at the selling price defined on the Product.
 // That price is never refused ("Prix trop bas"), whatever its margin; only a
 // discount below it is limited. Profit = selling price - acquisition cost.
-itest("the Product's own selling price is always accepted, even at or below its purchase cost", async () => {
-  // USD product priced below its cost: sells at its price and records the loss.
-  const clearance = await createProduct({ price: 8, currency: "USD", unitCost: 10, rate: 2850, stock: 10 });
-  const sold = await ctx.sell([usdLine(clearance, 1, 8)], { exchangeRate: 2850 });
+itest("the Product's own selling price is always accepted, even below its purchase cost", async () => {
+  const clearance = await createProduct({ price: 8000, unitCost: 10000, stock: 10 });
+  const sold = await ctx.sell([fcLine(clearance, 1, 8000)]);
   assert.equal(sold.status, 201, JSON.stringify(sold.body));
   const line = await savedItem(sold);
-  assert.deepEqual([line.revenue, line.costOfGoodsSold, line.grossProfit], [8, 10, -2]);
+  assert.deepEqual([line.revenue, line.costOfGoodsSold, line.grossProfit], [8000, 10000, -2000]);
 
-  // FC product: 20,000 FC price, 19,000 FC cost recorded at 2,850. The rate
-  // rises to 3,100, so the fixed FC price is now worth less than the USD
-  // cost: the normal price is still sold, never "Prix trop bas".
-  const robe = await createProduct({ price: 20000, currency: "FC", unitCost: 19000, rate: 2850, stock: 10 });
-  await ctx.setRate(3100);
-  const fcSale = await ctx.sell([fcLine(robe, 1, 20000)], { exchangeRate: 3100 });
-  assert.equal(fcSale.status, 201, JSON.stringify(fcSale.body));
-  const fcItem = await savedItem(fcSale);
-  assert.equal(fcItem.priceFC, 20000);
-  assert.equal(fcItem.discountApplied, false);
-  assert.equal(Math.round(fcItem.grossProfit * 100), Math.round(fcItem.revenue * 100) - Math.round(fcItem.costOfGoodsSold * 100));
-
+  const robe = await createProduct({ price: 20000, unitCost: 19000, stock: 10 });
+  const normal = await ctx.sell([fcLine(robe, 1, 20000)]);
+  assert.equal(normal.status, 201, JSON.stringify(normal.body));
   // A discount below such a price is still limited by the floor.
-  const discounted = await ctx.sell([fcLine(robe, 5, 15000)], { exchangeRate: 3100 });
+  const discounted = await ctx.sell([fcLine(robe, 5, 15000)]);
   assert.equal(discounted.body.error, "PRICE_TOO_LOW");
+});
+
+itest("the retired exchange-rate API answers 410 Gone", async () => {
+  for (const [method, path] of [["GET", "/exchange-rates/current"], ["GET", "/exchange-rates"], ["POST", "/exchange-rates"]]) {
+    const response = await ctx.request(method, path, { token: ctx.token("superadmin"), body: method === "POST" ? { rate: 2900 } : undefined });
+    assert.equal(response.status, 410, `${method} ${path}`);
+    assert.equal(response.body.error, "EXCHANGE_RATES_RETIRED");
+  }
 });

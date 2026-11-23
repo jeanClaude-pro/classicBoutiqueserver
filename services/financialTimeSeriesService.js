@@ -29,7 +29,6 @@ const BUSINESS_UTC_OFFSET_MS = 2 * 60 * 60 * 1000;
 
 const centsExpr = (expression) => ({ $floor: { $add: [{ $multiply: [expression, 100] }, 0.5] } });
 const money = (cents) => Number((cents / 100).toFixed(2));
-const fc = (value) => Number(Number(value || 0).toFixed(2));
 
 function badRequest(message) {
   return Object.assign(new Error(message), { status: 400 });
@@ -142,8 +141,6 @@ function saleSeriesPipeline(categories, range, granularity) {
   const sums = {
     revenueCents: { $sum: "$revenueCents" },
     cogsCents: { $sum: "$cogsCents" },
-    revenueFC: { $sum: "$revenueFC" },
-    cogsFC: { $sum: "$cogsFC" },
     units: { $sum: "$units" },
   };
   return [
@@ -155,8 +152,6 @@ function saleSeriesPipeline(categories, range, granularity) {
       category: "$items.mainCategory",
       revenueCents: line.revenueCents,
       cogsCents: line.cogsCents,
-      revenueFC: line.revenueFC,
-      cogsFC: line.cogsFC,
       units: "$items.quantity",
     } },
     // One row per (bucket, category, sale) so a sale is counted once per
@@ -168,8 +163,6 @@ function saleSeriesPipeline(categories, range, granularity) {
           _id: { bucket: "$_id.bucket", category: "$_id.category" },
           revenueCents: { $sum: "$revenueCents" },
           cogsCents: { $sum: "$cogsCents" },
-          revenueFC: { $sum: "$revenueFC" },
-          cogsFC: { $sum: "$cogsFC" },
           units: { $sum: "$units" },
           sales: { $sum: 1 },
         } },
@@ -193,13 +186,12 @@ function companyExpenseSeriesPipeline(categories, range, granularity) {
     } },
     { $group: {
       _id: { bucket: bucketKeyExpression("$validatedAt", granularity), category: "$category" },
-      amountCents: { $sum: { $multiply: [sign, centsExpr({ $ifNull: ["$amountUSD", "$amount"] })] } },
-      amountFC: { $sum: { $multiply: [sign, { $ifNull: ["$amountFC", 0] }] } },
+      amountCents: { $sum: { $multiply: [sign, centsExpr({ $ifNull: ["$amount", 0] })] } },
     } },
   ];
 }
 
-const emptyCents = () => ({ revenueCents: 0, cogsCents: 0, expenseCents: 0, revenueFC: 0, cogsFC: 0, expenseFC: 0, units: 0, sales: 0 });
+const emptyCents = () => ({ revenueCents: 0, cogsCents: 0, expenseCents: 0, units: 0, sales: 0 });
 
 function addCents(target, source) {
   for (const key of Object.keys(target)) target[key] += source[key] || 0;
@@ -218,11 +210,6 @@ function present(cents) {
     companyExpenses: money(cents.expenseCents),
     netResult: money(netCents),
     grossMargin: cents.revenueCents > 0 ? Number(((grossCents / cents.revenueCents) * 100).toFixed(2)) : null,
-    revenueFC: fc(cents.revenueFC),
-    costOfGoodsSoldFC: fc(cents.cogsFC),
-    grossProfitFC: fc(cents.revenueFC - cents.cogsFC),
-    companyExpensesFC: fc(cents.expenseFC),
-    netResultFC: fc(cents.revenueFC - cents.cogsFC - cents.expenseFC),
     sales: cents.sales,
     unitsSold: cents.units,
   };
@@ -254,12 +241,12 @@ async function buildFinancialTimeSeries({ category = null, query = {}, now = new
     if (!cell) continue;
     addCents(cell, {
       revenueCents: row.revenueCents, cogsCents: row.cogsCents,
-      revenueFC: row.revenueFC, cogsFC: row.cogsFC, units: row.units, sales: row.sales,
+      units: row.units, sales: row.sales,
     });
   }
   for (const row of expenseRows) {
     const cell = cellFor(row._id.bucket, row._id.category);
-    if (cell) addCents(cell, { expenseCents: row.amountCents, expenseFC: row.amountFC });
+    if (cell) addCents(cell, { expenseCents: row.amountCents });
   }
   const distinctSales = new Map(salesPerBucket.map((row) => [row._id, row.sales]));
 
@@ -306,7 +293,7 @@ async function buildFinancialTimeSeries({ category = null, query = {}, now = new
     range: { from, to, start, end, days },
     granularity,
     timezone: BUSINESS_TIMEZONE,
-    currency: "USD",
+    currency: "FC",
     categories,
     series,
     totals: {

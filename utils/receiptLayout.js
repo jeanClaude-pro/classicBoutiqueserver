@@ -50,21 +50,19 @@ function receiptLabels(supplied) {
   return labels;
 }
 
+const { fcSaleItem } = require("./currency");
+
 const finite = (value) => {
   if (value === undefined || value === null || value === "") return undefined;
   const number = Number(value);
   return Number.isFinite(number) ? number : undefined;
 };
 
-// Same priority as getItemFcUnitPrice (client/src/utils/salePricing.ts).
+// A line's FC unit price. Sales are sent already in FC; a reprint of a
+// pre-cutover line is read through its own FC snapshot (utils/currency.js).
 function fcUnitPrice(item, saleRate) {
-  const entered = finite(item.enteredPrice);
-  if (item.enteredCurrency === "FC" && entered !== undefined) return entered;
-  const priceFC = finite(item.priceFC);
-  if (priceFC !== undefined) return priceFC;
-  const rate = finite(item.exchangeRate) ?? finite(saleRate);
-  const usd = finite(item.unitSellingPrice ?? item.priceUSD ?? item.price ?? item.unitPrice);
-  return rate && rate > 0 && usd !== undefined ? Math.round(usd * rate) : undefined;
+  const price = finite(fcSaleItem(item, saleRate).price);
+  return price === undefined ? undefined : Math.round(price);
 }
 
 /** One ARTICLE / PU / QTE / TOTAL line per sale item, in FC. */

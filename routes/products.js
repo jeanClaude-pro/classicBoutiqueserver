@@ -10,13 +10,8 @@ const {
   normalizeMainCategory,
   normalizeQuantity,
 } = require("../utils/profitCalculations");
-const {
-  normalizeExchangeRate,
-  convertEnteredAmount,
-  productPriceAuthority,
-  SUPPORTED_CURRENCIES,
-} = require("../utils/salePricing");
-const { getFallbackExchangeRate } = require("../utils/currentExchangeRate");
+const { CurrencyError, assertFC } = require("../utils/salePricing");
+const { CURRENCY, fcProduct } = require("../utils/currency");
 const { recordProductEditMovements, recordStockMovement } = require("../services/stockMovementService");
 const { validateObjectIdParam } = require("../middleware/security");
 const { requireModuleAccess } = require("../middleware/moduleAccess");
@@ -48,48 +43,24 @@ async function runTransaction(work) {
   } finally { await session.endSession(); }
 }
 
-// unitCost/price stay the canonical USD figures every profit calculation
-// reads from (semantics unchanged). This mirrors normalizeAmountSnapshot
-// (same convertEnteredAmount formula) but allows a zero unitCost, which is a
+// Product money is FC: `price` is the normal selling price and `unitCost`
+// the acquisition cost of ONE piece, both in francs. A zero unitCost is a
 // legitimate acquisition cost for donated/promotional stock.
-function normalizeProductMoney(fieldName, enteredAmount, enteredCurrency, exchangeRateInput, fallbackRate, { allowZero = false } = {}) {
+function normalizeProductMoney(fieldName, enteredAmount, enteredCurrency, { allowZero = false } = {}) {
+  assertFC(enteredCurrency);
   const amount = Number(enteredAmount);
   if (!Number.isFinite(amount) || amount < 0 || (!allowZero && amount <= 0)) {
     throw new RangeError(`${fieldName} must be ${allowZero ? "zero or greater" : "greater than zero"}`);
   }
-  const currency = enteredCurrency || "USD";
-  if (!SUPPORTED_CURRENCIES.has(currency)) {
-    throw new RangeError(`${fieldName}EnteredCurrency must be USD or FC`);
-  }
-  const exchangeRate = normalizeExchangeRate(exchangeRateInput ?? fallbackRate);
-  if (currency === "FC" && !exchangeRate) {
-    throw new RangeError(`exchangeRate is required for an FC ${fieldName}`);
-  }
-  const { amountUSD, amountFC } = convertEnteredAmount(amount, currency, exchangeRate);
-  return { amountUSD, enteredAmount: amount, enteredCurrency: currency, amountFC, exchangeRate };
+  return amount;
 }
-
-// The amount the user defined, in the currency they defined it in. Legacy
-// costs without entered fields only ever had the USD unitCost.
-function unitCostAuthority(product) {
-  if (product?.unitCostEnteredCurrency === "FC") {
-    const fc = Number(product.unitCostEnteredAmount ?? product.unitCostFC);
-    if (Number.isFinite(fc)) return { currency: "FC", amount: fc };
-  }
-  return { currency: "USD", amount: Number(product?.unitCostEnteredAmount ?? product?.unitCost) };
-}
-
-// Re-submitting the same amount in the same currency (an edit form saved to
-// change the name or stock) is not a price change: the existing snapshot is
-// kept as-is instead of being re-derived at today's rate. Only a different
-// amount or currency makes the new entry authoritative.
-const isSameEntry = (authority, submitted) =>
-  authority.currency === submitted.enteredCurrency && authority.amount === submitted.enteredAmount;
 
 // unitCost is the acquisition cost of ONE piece, as entered by the user.
 // totalAcquisitionCost (the stock's total acquisition value) is always
-// derived from it — never the other way around.
-async function financialProductFields(body, existing = null) {
+// derived from it — never the other way around. `existing` is a lean read,
+// so a product not yet converted to FC is already presented in FC; saving it
+// writes it as an FC product.
+function financialProductFields(body, existing = null) {
   const mainCategory = normalizeMainCategory(body.mainCategory ?? existing?.mainCategory);
   const purchasedQuantity = normalizeQuantity(
     body.purchasedQuantity ?? existing?.purchasedQuantity,
@@ -98,71 +69,42 @@ async function financialProductFields(body, existing = null) {
   const stock = Number(body.stock ?? existing?.stock ?? purchasedQuantity);
   if (!Number.isInteger(stock) || stock < 0) throw new RangeError("stock must be a non-negative integer");
 
-  const priceTouched = !existing || body.price !== undefined || body.priceEnteredAmount !== undefined || body.priceEnteredCurrency !== undefined;
-  const unitCostTouched = !existing || body.unitCost !== undefined || body.unitCostEnteredAmount !== undefined || body.unitCostEnteredCurrency !== undefined;
-  const fallbackRate = (priceTouched || unitCostTouched) ? await getFallbackExchangeRate() : undefined;
-
-  let price = {
-    amountUSD: existing?.price,
-    enteredAmount: existing?.priceEnteredAmount,
-    enteredCurrency: existing?.priceEnteredCurrency,
-    amountFC: existing?.priceFC,
-    exchangeRate: existing?.priceExchangeRate,
-  };
-  if (priceTouched) {
-    const submitted = normalizeProductMoney(
-      "price",
-      body.priceEnteredAmount ?? body.price,
-      body.priceEnteredCurrency,
-      body.priceExchangeRate,
-      fallbackRate
-    );
-    if (!existing || !isSameEntry(productPriceAuthority(existing), submitted)) price = submitted;
-  }
-
-  let unitCost = {
-    amountUSD: existing?.unitCost,
-    enteredAmount: existing?.unitCostEnteredAmount,
-    enteredCurrency: existing?.unitCostEnteredCurrency,
-    amountFC: existing?.unitCostFC,
-    exchangeRate: existing?.unitCostExchangeRate,
-  };
-  if (unitCostTouched) {
-    const submitted = normalizeProductMoney(
-      "unitCost",
-      body.unitCostEnteredAmount ?? body.unitCost,
-      body.unitCostEnteredCurrency,
-      body.unitCostExchangeRate,
-      fallbackRate,
-      { allowZero: true }
-    );
-    if (!existing || !isSameEntry(unitCostAuthority(existing), submitted)) unitCost = submitted;
-  }
-
-  const totalAcquisitionCost = calculateTotalAcquisitionValue(unitCost.amountUSD, purchasedQuantity);
-  const totalAcquisitionCostFC =
-    unitCost.amountFC !== undefined ? Math.round(unitCost.amountFC * purchasedQuantity) : undefined;
+  const priceTouched = !existing || body.price !== undefined || body.priceEnteredAmount !== undefined;
+  const unitCostTouched = !existing || body.unitCost !== undefined || body.unitCostEnteredAmount !== undefined;
+  const price = priceTouched
+    ? normalizeProductMoney("price", body.priceEnteredAmount ?? body.price, body.priceEnteredCurrency)
+    : existing.price;
+  const unitCost = unitCostTouched
+    ? normalizeProductMoney("unitCost", body.unitCostEnteredAmount ?? body.unitCost, body.unitCostEnteredCurrency, { allowZero: true })
+    : existing.unitCost;
+  if (!(Number(price) > 0)) throw new RangeError("price must be greater than zero");
+  if (!Number.isFinite(Number(unitCost)) || Number(unitCost) < 0) throw new RangeError("unitCost must be zero or greater");
+  const totalAcquisitionCost = calculateTotalAcquisitionValue(unitCost, purchasedQuantity);
 
   return {
+    currency: CURRENCY,
     mainCategory,
     subcategory: String(body.subcategory ?? existing?.subcategory ?? body.category ?? existing?.category ?? "").trim(),
     category: String(body.subcategory ?? existing?.subcategory ?? body.category ?? existing?.category ?? mainCategory).trim() || mainCategory,
     purchasedQuantity,
-    unitCost: unitCost.amountUSD,
-    unitCostEnteredAmount: unitCost.enteredAmount,
-    unitCostEnteredCurrency: unitCost.enteredCurrency,
-    unitCostFC: unitCost.amountFC,
-    unitCostExchangeRate: unitCost.exchangeRate,
+    unitCost,
+    unitCostEnteredAmount: unitCost,
+    unitCostEnteredCurrency: CURRENCY,
+    unitCostFC: unitCost,
     totalAcquisitionCost,
-    totalAcquisitionCostFC,
-    price: price.amountUSD,
-    priceEnteredAmount: price.enteredAmount,
-    priceEnteredCurrency: price.enteredCurrency,
-    priceFC: price.amountFC,
-    priceExchangeRate: price.exchangeRate,
+    totalAcquisitionCostFC: totalAcquisitionCost,
+    price,
+    priceEnteredAmount: price,
+    priceEnteredCurrency: CURRENCY,
+    priceFC: price,
     stock,
   };
 }
+
+// Legacy per-currency rate snapshots are dropped when a product is saved.
+const LEGACY_PRODUCT_FIELDS = { priceExchangeRate: 1, unitCostExchangeRate: 1 };
+
+const sendProduct = (product) => fcProduct(typeof product?.toObject === "function" ? product.toObject() : product);
 
 // GET /api/products - Get all products with optional filtering
 router.get("/", authMiddleware, canReadProducts, async (req, res) => {
@@ -190,7 +132,7 @@ router.get("/", authMiddleware, canReadProducts, async (req, res) => {
       filter.status = status;
     }
 
-    const query = Product.find(filter).sort({ createdAt: -1 });
+    const query = Product.find(filter).sort({ createdAt: -1 }).lean();
     if (!canViewAcquisitionCosts(req.user)) query.select(acquisitionCostProjection);
     const products = await query;
     res.json(products);
@@ -208,7 +150,7 @@ router.get("/:id", authMiddleware, canReadProducts, async (req, res) => {
       ...(isShareholderAdmin(req.user) ? { mainCategory: req.user.assignedCategory } : {}),
     });
     if (!canViewAcquisitionCosts(req.user)) query.select(acquisitionCostProjection);
-    const product = await query;
+    const product = await query.lean();
 
     if (!product) {
       return res.status(404).json({ error: "Product not found" });
@@ -258,7 +200,7 @@ router.post("/", authMiddleware, isAdmin, async (req, res) => {
     if (status !== undefined && !PRODUCT_STATUSES.has(status)) {
       return res.status(400).json({ error: "Invalid status" });
     }
-    const financialFields = await financialProductFields(req.body);
+    const financialFields = financialProductFields(req.body);
     const product = new Product({
       name: boundedString(name, 200),
       description: boundedString(description, 2000),
@@ -285,8 +227,8 @@ router.post("/", authMiddleware, isAdmin, async (req, res) => {
       });
       return product;
     });
-    await recordAudit({ req, action: "PRODUCT_CREATED", targetType: "Product", targetId: savedProduct._id, after: { name: savedProduct.name, mainCategory: savedProduct.mainCategory, stock: savedProduct.stock, price: savedProduct.price, unitCost: savedProduct.unitCost } });
-    res.status(201).json(savedProduct);
+    await recordAudit({ req, action: "PRODUCT_CREATED", targetType: "Product", targetId: savedProduct._id, after: { name: savedProduct.name, mainCategory: savedProduct.mainCategory, stock: savedProduct.stock, currency: CURRENCY, price: savedProduct.price, unitCost: savedProduct.unitCost } });
+    res.status(201).json(sendProduct(savedProduct));
   } catch (error) {
     console.error("Error creating product:", error);
 
@@ -295,7 +237,7 @@ router.post("/", authMiddleware, isAdmin, async (req, res) => {
       return res.status(400).json({ error: errors.join(", ") });
     }
 
-    if (error instanceof RangeError || error instanceof TypeError) {
+    if (error instanceof RangeError || error instanceof TypeError || error instanceof CurrencyError) {
       return res.status(400).json({ error: error.message });
     }
 
@@ -328,7 +270,7 @@ router.put("/:id", authMiddleware, isAdmin, async (req, res) => {
     }
     const existingProduct = await Product.findById(req.params.id).lean();
     if (!existingProduct) return res.status(404).json({ error: "Product not found" });
-    const financialFields = await financialProductFields(req.body, existingProduct);
+    const financialFields = financialProductFields(req.body, existingProduct);
 
     // Build update object with only provided fields
     const updateData = {};
@@ -348,7 +290,7 @@ router.put("/:id", authMiddleware, isAdmin, async (req, res) => {
     const updatedProduct = await runTransaction(async (session) => {
       const updated = await Product.findOneAndUpdate(
         { _id: req.params.id, __v: existingProduct.__v, stock: existingProduct.stock },
-        { $set: updateData, $inc: { __v: 1 } },
+        { $set: updateData, $unset: LEGACY_PRODUCT_FIELDS, $inc: { __v: 1 } },
         { new: true, runValidators: true, session }
       );
       if (updated) {
@@ -361,13 +303,13 @@ router.put("/:id", authMiddleware, isAdmin, async (req, res) => {
       return res.status(409).json({ error: "Product changed; refresh and retry" });
     }
 
-    const tracked = ["name", "stock", "price", "unitCost", "mainCategory", "status", "minStock"];
+    const tracked = ["name", "stock", "currency", "price", "unitCost", "mainCategory", "status", "minStock"];
     await recordAudit({
       req, action: "PRODUCT_UPDATED", targetType: "Product", targetId: updatedProduct._id,
       before: Object.fromEntries(tracked.map((key) => [key, existingProduct[key]])),
       after: Object.fromEntries(tracked.map((key) => [key, updatedProduct[key]])),
     });
-    res.json(updatedProduct);
+    res.json(sendProduct(updatedProduct));
   } catch (error) {
     console.error("Error updating product:", error);
 
@@ -380,7 +322,7 @@ router.put("/:id", authMiddleware, isAdmin, async (req, res) => {
       return res.status(400).json({ error: errors.join(", ") });
     }
 
-    if (error instanceof RangeError || error instanceof TypeError) {
+    if (error instanceof RangeError || error instanceof TypeError || error instanceof CurrencyError) {
       return res.status(400).json({ error: error.message });
     }
 

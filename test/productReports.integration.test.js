@@ -3,6 +3,7 @@
 //   inventory value  = closing quantity x CURRENT selling price (unsold stock)
 //   profit           = actual selling amount - purchase cost (sale snapshots)
 //   revenue          = purchase cost + profit = actual selling amount
+// Every amount is in Congolese francs (FC), as { fc } money objects.
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { SKIP, createIntegrationContext } = require("./helpers/integrationContext");
@@ -16,17 +17,15 @@ test.after(ctx.teardown);
 test.beforeEach(ctx.reset);
 const itest = (name, fn) => test(name, { skip: SKIP }, fn);
 
-const RATE = 2850;
 let counter = 0;
-async function createProduct({ price, currency = "USD", unitCost, stock, mainCategory = "CLOTHES", name }) {
-  await ctx.setRate(RATE);
+async function createProduct({ price, unitCost, stock, mainCategory = "CLOTHES", name }) {
   counter += 1;
   const response = await ctx.request("POST", "/products", {
     token: ctx.token("superadmin"),
     body: {
       name: name || `Produit ${counter}`, mainCategory, subcategory: "Test", purchasedQuantity: stock, stock,
-      priceEnteredAmount: price, priceEnteredCurrency: currency, priceExchangeRate: RATE,
-      unitCostEnteredAmount: unitCost, unitCostEnteredCurrency: currency, unitCostExchangeRate: RATE,
+      priceEnteredAmount: price, priceEnteredCurrency: "FC",
+      unitCostEnteredAmount: unitCost, unitCostEnteredCurrency: "FC",
     },
   });
   assert.equal(response.status, 201, JSON.stringify(response.body));
@@ -38,21 +37,21 @@ const productSheet = (product, role = "superadmin", query = todayQuery()) =>
   ctx.request("GET", `/products/${product._id}/stock-sheet?${query}`, { token: ctx.token(role) });
 const salesSheet = (role = "superadmin", query = todayQuery()) =>
   ctx.request("GET", `/analytics/sales-sheet?${query}`, { token: ctx.token(role) });
-const sell = (lines, extra = {}) => ctx.sell(lines.map(([product, quantity, price]) => ({ product, quantity, price })), { exchangeRate: RATE, ...extra });
+const sell = (lines, extra = {}) => ctx.sell(lines.map(([product, quantity, price]) => ({ product, quantity, price })), extra);
 const cents = (value) => Math.round(value * 100);
 
 // ------------------------------------------------------ individual Fiche de stock
 
 itest("each product's fiche reports that product only, reconciled and valued at its selling price", async () => {
-  const a = await createProduct({ name: "Chemise Classic", price: 20, unitCost: 10, stock: 10 });
-  const b = await createProduct({ name: "Nike Air", price: 50, unitCost: 30, stock: 8, mainCategory: "SHOES" });
+  const a = await createProduct({ name: "Chemise Classic", price: 20000, unitCost: 10000, stock: 10 });
+  const b = await createProduct({ name: "Nike Air", price: 50000, unitCost: 30000, stock: 8, mainCategory: "SHOES" });
   assert.equal((await ctx.request("PUT", `/products/${a._id}`, { token: ctx.token("superadmin"), body: { stock: 16 } })).status, 200);
   assert.equal((await ctx.request("PUT", `/products/${a._id}`, { token: ctx.token("superadmin"), body: { stock: 15 } })).status, 200);
-  const sold = await sell([[await Product.findById(a._id), 3, 20]]);
+  const sold = await sell([[await Product.findById(a._id), 3, 20000]]);
   assert.equal(sold.status, 201, JSON.stringify(sold.body));
   await ctx.request("PATCH", `/sales/${sold.body._id}/void`, { token: ctx.token("superadmin"), body: { reason: "test" } });
-  assert.equal((await sell([[await Product.findById(a._id), 2, 20]])).status, 201);
-  await sell([[await Product.findById(b._id), 1, 50]]);
+  assert.equal((await sell([[await Product.findById(a._id), 2, 20000]])).status, 201);
+  await sell([[await Product.findById(b._id), 1, 50000]]);
 
   const sheetA = await productSheet(a);
   assert.equal(sheetA.status, 200, JSON.stringify(sheetA.body));
@@ -62,31 +61,30 @@ itest("each product's fiche reports that product only, reconciled and valued at 
   const row = sheetA.body.row;
   assert.deepEqual([row.openingStock, row.additions, row.reductions, row.salesOut, row.closingStock], [0, 16, 1, 2, 13]);
   assert.equal(row.openingStock + row.additions - row.reductions - row.salesOut, row.closingStock);
-  // 13 pieces x $20 = $260 (FC: 13 x 57,000 = 741,000).
-  assert.deepEqual(row.sellingPrice, { currency: "USD", usd: 20, fc: 57000 });
-  assert.deepEqual(row.inventoryValue, { usd: 260, fc: 741000 });
+  // 13 pieces x 20,000 FC = 260,000 FC.
+  assert.deepEqual(row.sellingPrice, { currency: "FC", fc: 20000 });
+  assert.deepEqual(row.inventoryValue, { fc: 260000 });
 
   const sheetB = await productSheet(b);
   assert.equal(sheetB.body.product.name, "Nike Air");
   assert.deepEqual([sheetB.body.row.openingStock, sheetB.body.row.salesOut, sheetB.body.row.closingStock], [0, 1, 7]);
-  assert.deepEqual(sheetB.body.row.inventoryValue, { usd: 350, fc: 7 * 142500 });
+  assert.deepEqual(sheetB.body.row.inventoryValue, { fc: 350000 });
 });
 
-itest("an FC-defined product is valued exactly in FC at its current price", async () => {
-  const robe = await createProduct({ name: "Robe FC", price: 20000, currency: "FC", unitCost: 10000, stock: 7 });
+itest("valuation follows today's FC selling price, never a sale price, and is read-only", async () => {
+  const robe = await createProduct({ name: "Robe", price: 20000, unitCost: 10000, stock: 7 });
   const response = await productSheet(robe);
-  assert.deepEqual(response.body.row.sellingPrice, { currency: "FC", usd: 7.02, fc: 20000 });
-  assert.deepEqual(response.body.row.inventoryValue, { fc: 140000, usd: 49.12 });
-  // Valuation follows today's selling price, never a sale price, and is read-only.
-  await ctx.request("PUT", `/products/${robe._id}`, { token: ctx.token("superadmin"), body: { priceEnteredAmount: 25000, priceEnteredCurrency: "FC", priceExchangeRate: RATE } });
+  assert.deepEqual(response.body.row.sellingPrice, { currency: "FC", fc: 20000 });
+  assert.deepEqual(response.body.row.inventoryValue, { fc: 140000 });
+  await ctx.request("PUT", `/products/${robe._id}`, { token: ctx.token("superadmin"), body: { priceEnteredAmount: 25000, priceEnteredCurrency: "FC" } });
   const repriced = await productSheet(robe);
   assert.equal(repriced.body.row.inventoryValue.fc, 175000);
   const stored = await Product.findById(robe._id).lean();
-  assert.equal(stored.priceEnteredAmount, 25000);
+  assert.deepEqual([stored.currency, stored.price, stored.priceEnteredAmount, stored.priceExchangeRate], ["FC", 25000, 25000, undefined]);
 });
 
 itest("the individual fiche enforces category authorization, ids and the selected period", async () => {
-  const shoes = await createProduct({ price: 50, unitCost: 30, stock: 4, mainCategory: "SHOES" });
+  const shoes = await createProduct({ price: 50000, unitCost: 30000, stock: 4, mainCategory: "SHOES" });
   assert.equal((await productSheet(shoes, "clothesShareholder")).status, 403);
   assert.equal((await productSheet(shoes, "shoesShareholder")).status, 200);
   assert.equal((await ctx.request("GET", `/products/not-an-id/stock-sheet?${todayQuery()}`, { token: ctx.token("superadmin") })).status, 400);
@@ -99,12 +97,13 @@ itest("the individual fiche enforces category authorization, ids and the selecte
 });
 
 itest("the global stock sheet carries per-product valuation and respects category pinning", async () => {
-  await createProduct({ name: "A", price: 20, unitCost: 10, stock: 3 });
-  await createProduct({ name: "B", price: 20000, currency: "FC", unitCost: 9000, stock: 2 });
-  await createProduct({ name: "S", price: 50, unitCost: 30, stock: 1, mainCategory: "SHOES" });
+  await createProduct({ name: "A", price: 57000, unitCost: 28500, stock: 3 });
+  await createProduct({ name: "B", price: 20000, unitCost: 9000, stock: 2 });
+  await createProduct({ name: "S", price: 142500, unitCost: 85500, stock: 1, mainCategory: "SHOES" });
   const all = await ctx.request("GET", `/products/stock-sheet?${todayQuery()}`, { token: ctx.token("superadmin") });
+  assert.equal(all.body.currency, "FC");
   assert.deepEqual(all.body.rows.map((row) => [row.product, row.inventoryValue.fc]), [["A", 171000], ["B", 40000], ["S", 142500]]);
-  assert.deepEqual(all.body.totals.inventoryValue, { usd: 124.04, fc: 171000 + 40000 + 142500 });
+  assert.deepEqual(all.body.totals.inventoryValue, { fc: 171000 + 40000 + 142500 });
   const clothes = await ctx.request("GET", `/products/stock-sheet?${todayQuery()}&category=SHOES`, { token: ctx.token("clothesShareholder") });
   assert.deepEqual(clothes.body.rows.map((row) => row.product), ["A", "B"]);
 });
@@ -112,61 +111,50 @@ itest("the global stock sheet carries per-product valuation and respects categor
 // ------------------------------------------------------ products sold financials
 
 itest("profit = selling amount - purchase cost and revenue = purchase cost + profit, per product and in total", async () => {
-  const shirt = await createProduct({ name: "Chemise", price: 20, unitCost: 10, stock: 20 });
-  const tie = await createProduct({ name: "Cravate", price: 20, unitCost: 10, stock: 20 });
-  // 4 shirts at the discounted $15 + 1 tie at $20 = a 5-piece cart.
-  const sale = await sell([[shirt, 4, 15], [tie, 1, 20]]);
+  const shirt = await createProduct({ name: "Chemise", price: 20000, unitCost: 10000, stock: 20 });
+  const tie = await createProduct({ name: "Cravate", price: 20000, unitCost: 10000, stock: 20 });
+  // 4 shirts at the discounted 15,000 FC + 1 tie at 20,000 FC = a 5-piece cart.
+  const sale = await sell([[shirt, 4, 15000], [tie, 1, 20000]]);
   assert.equal(sale.status, 201, JSON.stringify(sale.body));
 
   const response = await salesSheet();
   assert.equal(response.body.financialsVisible, true);
+  assert.equal(response.body.currency, "FC");
   const row = response.body.rows.find((item) => item.product === "Chemise");
-  // Purchase cost 4 x $10 = $40, revenue 4 x $15 = $60, profit $60 - $40 = $20.
-  assert.deepEqual([row.quantitySold, row.purchaseCost.usd, row.revenue.usd, row.profit.usd], [4, 40, 60, 20]);
-  assert.equal(cents(row.revenue.usd), cents(row.purchaseCost.usd) + cents(row.profit.usd));
-  assert.equal(row.revenue.fc, row.purchaseCost.fc + row.profit.fc);
-  assert.deepEqual([row.purchaseCost.fc, row.revenue.fc, row.profit.fc], [114000, 171000, 57000]);
+  // Purchase cost 4 x 10,000 = 40,000, revenue 4 x 15,000 = 60,000, profit 20,000.
+  assert.deepEqual([row.quantitySold, row.purchaseCost, row.revenue, row.profit], [4, { fc: 40000 }, { fc: 60000 }, { fc: 20000 }]);
+  assert.equal(cents(row.revenue.fc), cents(row.purchaseCost.fc) + cents(row.profit.fc));
 
   const { summary } = response.body;
-  assert.deepEqual([summary.unitsSold, summary.purchaseCost.usd, summary.revenue.usd, summary.profit.usd], [5, 50, 80, 30]);
-  assert.equal(cents(summary.revenue.usd), cents(summary.purchaseCost.usd) + cents(summary.profit.usd));
-  assert.equal(summary.revenue.fc, summary.purchaseCost.fc + summary.profit.fc);
+  assert.deepEqual([summary.unitsSold, summary.purchaseCost, summary.revenue, summary.profit], [5, { fc: 50000 }, { fc: 80000 }, { fc: 30000 }]);
+  assert.equal(cents(summary.revenue.fc), cents(summary.purchaseCost.fc) + cents(summary.profit.fc));
 });
 
-// The protected-profit floor keeps half the normal margin: with cost $10 and
-// normal price $20 the lowest family price is $15 (a $14 request is refused).
+// The protected-profit floor keeps half the normal margin: with cost 10,000
+// and normal price 20,000 FC the lowest family price is 15,000 FC.
 itest("a family sale is reported at its actual discounted price, and old costs stay historical", async () => {
-  const product = await createProduct({ name: "Veste", price: 20, unitCost: 10, stock: 5 });
+  const product = await createProduct({ name: "Veste", price: 20000, unitCost: 10000, stock: 5 });
   const member = await Customer.create({ name: "Famille", phone: "0991001000", isFamilyMember: true });
   const response = await ctx.request("POST", "/sales", {
     token: ctx.token("superadmin"),
     body: {
       isFamilySale: true, familyMemberId: String(member._id), isWalkIn: false, customer: { name: "Famille", phone: "0991001000" },
-      exchangeRate: RATE, paymentMethod: "cash", requestKey: "family-report-1",
-      items: [{ productId: String(product._id), quantity: 1, price: 16, enteredPrice: 16, enteredCurrency: "USD", exchangeRate: RATE }],
+      currency: "FC", paymentMethod: "cash", requestKey: "family-report-1",
+      items: [{ productId: String(product._id), quantity: 1, price: 16000, enteredPrice: 16000, enteredCurrency: "FC" }],
     },
   });
   assert.equal(response.status, 201, JSON.stringify(response.body));
   // Today's purchase cost changes later; the report keeps the sale's snapshot.
-  await ctx.request("PUT", `/products/${product._id}`, { token: ctx.token("superadmin"), body: { unitCostEnteredAmount: 12, unitCostEnteredCurrency: "USD", unitCostExchangeRate: RATE } });
+  await ctx.request("PUT", `/products/${product._id}`, { token: ctx.token("superadmin"), body: { unitCostEnteredAmount: 12000, unitCostEnteredCurrency: "FC" } });
   const row = (await salesSheet()).body.rows.find((item) => item.product === "Veste");
-  // Family price $16 (normal $20, cost $10): revenue $16, profit $16 - $10 = $6.
-  assert.deepEqual([row.quantitySold, row.revenue.usd, row.purchaseCost.usd, row.profit.usd], [1, 16, 10, 6]);
-});
-
-itest("FC-defined products keep exact FC amounts in the products-sold totals", async () => {
-  const robe = await createProduct({ name: "Robe", price: 20000, currency: "FC", unitCost: 10000, stock: 10 });
-  const sale = await ctx.sell([{ product: robe, quantity: 2, price: 20000 / RATE, enteredPrice: 20000, enteredCurrency: "FC" }], { exchangeRate: RATE });
-  assert.equal(sale.status, 201, JSON.stringify(sale.body));
-  const row = (await salesSheet()).body.rows.find((item) => item.product === "Robe");
-  assert.deepEqual([row.revenue.fc, row.purchaseCost.fc, row.profit.fc], [40000, 20000, 20000]);
-  assert.equal(cents(row.revenue.usd), cents(row.purchaseCost.usd) + cents(row.profit.usd));
+  // Family price 16,000 (normal 20,000, cost 10,000): revenue 16,000, profit 6,000.
+  assert.deepEqual([row.quantitySold, row.revenue.fc, row.purchaseCost.fc, row.profit.fc], [1, 16000, 10000, 6000]);
 });
 
 itest("purchase cost and profit are only returned to the superadmin and shareholders, per category", async () => {
-  const clothes = await createProduct({ name: "C", price: 20, unitCost: 10, stock: 10 });
-  const shoes = await createProduct({ name: "S", price: 50, unitCost: 30, stock: 10, mainCategory: "SHOES" });
-  await sell([[clothes, 1, 20], [shoes, 1, 50]]);
+  const clothes = await createProduct({ name: "C", price: 20000, unitCost: 10000, stock: 10 });
+  const shoes = await createProduct({ name: "S", price: 50000, unitCost: 30000, stock: 10, mainCategory: "SHOES" });
+  await sell([[clothes, 1, 20000], [shoes, 1, 50000]]);
   const manager = await salesSheet("reportsManager");
   assert.equal(manager.status, 200);
   assert.equal(manager.body.financialsVisible, false);
@@ -176,28 +164,25 @@ itest("purchase cost and profit are only returned to the superadmin and sharehol
 
   const shareholder = await salesSheet("shoesShareholder", `${todayQuery()}&category=CLOTHES`);
   assert.equal(shareholder.body.category, "SHOES");
-  assert.deepEqual(shareholder.body.rows.map((row) => [row.product, row.profit.usd]), [["S", 20]]);
+  assert.deepEqual(shareholder.body.rows.map((row) => [row.product, row.profit.fc]), [["S", 20000]]);
 });
 
-itest("the sales sheet lists, per product, each price it was sold at and the pieces that left at that price", async () => {
-  const shirt = await createProduct({ name: "Chemise", price: 20, unitCost: 10, stock: 20 });
-  const tie = await createProduct({ name: "Cravate", price: 20, unitCost: 10, stock: 20 });
-  const robe = await createProduct({ name: "Robe", price: 20000, currency: "FC", unitCost: 10000, stock: 10 });
-  assert.equal((await sell([[shirt, 4, 15], [tie, 1, 20]])).status, 201); // 4 shirts at the discounted $15
-  assert.equal((await sell([[shirt, 1, 20]])).status, 201); // 1 shirt at its normal $20
-  const fcSale = await ctx.sell([{ product: robe, quantity: 2, price: 20000 / RATE, enteredPrice: 20000, enteredCurrency: "FC" }], { exchangeRate: RATE });
-  assert.equal(fcSale.status, 201, JSON.stringify(fcSale.body));
+itest("the sales sheet lists, per product, each FC price it was sold at and the pieces that left at that price", async () => {
+  const shirt = await createProduct({ name: "Chemise", price: 20000, unitCost: 10000, stock: 20 });
+  const tie = await createProduct({ name: "Cravate", price: 20000, unitCost: 10000, stock: 20 });
+  assert.equal((await sell([[shirt, 4, 15000], [tie, 1, 20000]])).status, 201); // 4 shirts at the discounted 15,000 FC
+  assert.equal((await sell([[shirt, 1, 20000]])).status, 201); // 1 shirt at its normal 20,000 FC
 
   const { body } = await salesSheet();
   const row = (name) => body.rows.find((item) => item.product === name);
   assert.equal(row("Chemise").quantitySold, 5);
-  assert.deepEqual(row("Chemise").prices.map((price) => [price.currency, price.unitPrice.usd, price.quantity, price.revenue.usd]), [
-    ["USD", 20, 1, 20],
-    ["USD", 15, 4, 60],
+  assert.deepEqual(row("Chemise").prices.map((price) => [price.currency, price.unitPrice.fc, price.quantity, price.revenue.fc]), [
+    ["FC", 20000, 1, 20000],
+    ["FC", 15000, 4, 60000],
   ]);
-  assert.deepEqual(row("Chemise").revenue, { usd: 80, fc: 228000 }, "revenue = sum of price x pieces");
-  assert.deepEqual(row("Robe").prices.map((price) => [price.currency, price.unitPrice.fc, price.quantity, price.revenue.fc]), [["FC", 20000, 2, 40000]]);
-  assert.equal(body.summary.unitsSold, 8);
+  assert.deepEqual(row("Chemise").revenue, { fc: 80000 }, "revenue = sum of price x pieces");
+  assert.doesNotMatch(JSON.stringify(body), /"usd"|USD/, "no dollar amount anywhere");
+  assert.equal(body.summary.unitsSold, 6);
 
   // Without financial access the price and pieces are still shown.
   const manager = await salesSheet("reportsManager");

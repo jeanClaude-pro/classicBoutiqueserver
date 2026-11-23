@@ -166,7 +166,7 @@ itest("27c. the same request key with different financial data is a conflict", a
   assert.equal(changed.body.error, "IDEMPOTENCY_CONFLICT");
   assert.match(changed.body.message, /données différentes/);
   assert.equal(await Expense.countDocuments({ requestKey: key }), 1);
-  assert.equal((await Expense.findOne({ requestKey: key }).lean()).amountUSD, 100);
+  assert.equal((await Expense.findOne({ requestKey: key }).lean()).amount, 100);
   assert.equal((await ctx.balance("SHOES")).availablePurchaseFunds, 900);
 });
 

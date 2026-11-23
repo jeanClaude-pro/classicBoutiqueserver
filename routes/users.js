@@ -1,5 +1,6 @@
 const express = require("express");
 const router = express.Router();
+const bcrypt = require("bcryptjs");
 const User = require("../models/User");
 const authMiddleware = require("../middleware/auth");
 const { validateObjectIdParam } = require("../middleware/security");
@@ -64,6 +65,56 @@ router.get("/", async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ message: "Internal server error" });
+  }
+});
+
+// Create an account — superadmin only. This is the only way an account is
+// created (there is no public sign-up). The account is active immediately and
+// receives only the modules the superadmin grants.
+router.post("/", async (req, res) => {
+  try {
+    if (!requireSuperAdmin(req, res)) return;
+    const body = req.body || {};
+    const username = typeof body.username === "string" ? body.username.trim() : "";
+    const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
+    const password = typeof body.password === "string" ? body.password : "";
+    const role = body.role;
+    if (!username || username.length > 80) {
+      return res.status(400).json({ message: "Le nom d'utilisateur est requis (80 caractères maximum)" });
+    }
+    if (!EMAIL_PATTERN.test(email) || email.length > 254) {
+      return res.status(400).json({ message: "Adresse email invalide" });
+    }
+    if (password.length < 10 || password.length > 128) {
+      return res.status(400).json({ message: "Le mot de passe doit comporter entre 10 et 128 caractères" });
+    }
+    if (!VALID_ROLES.includes(role)) return res.status(400).json({ message: "Invalid role" });
+    const assignedCategory = role === "admin" ? body.assignedCategory : undefined;
+    if (role === "admin" && !["CLOTHES", "SHOES"].includes(assignedCategory)) {
+      return res.status(400).json({ message: "assignedCategory is required for shareholder admins" });
+    }
+    const requested = Array.isArray(body.permissions) ? body.permissions.slice(0, 50) : [];
+    const permissions = [...new Set(requested.filter((permission) =>
+      typeof permission === "string" && GRANTABLE_MODULES.has(permission)
+      && (role !== "admin" || SHAREHOLDER_ALLOWED_MODULES.has(permission))
+    ))];
+
+    const user = await User.create({
+      username,
+      email,
+      password: await bcrypt.hash(password, 12),
+      role,
+      ...(assignedCategory ? { assignedCategory } : {}),
+      permissions,
+      isActive: true,
+    });
+    const created = await User.findById(user._id).select(PUBLIC_FIELDS);
+    await recordAudit({ req, action: "USER_CREATED", targetType: "User", targetId: user._id, after: userSnapshot(created) });
+    return res.status(201).json(created);
+  } catch (error) {
+    if (error?.code === 11000) return res.status(409).json({ message: "Cet email est déjà utilisé" });
+    console.error("Error creating user:", error?.name || "Error");
+    return res.status(500).json({ message: "Internal server error" });
   }
 });
 

@@ -23,15 +23,15 @@ const {
   buildCategoryReport,
 } = require("../services/financialAccountingService");
 const { buildFinancialTimeSeries } = require("../services/financialTimeSeriesService");
-const { getFallbackExchangeRate } = require("../utils/currentExchangeRate");
-const { productNormalPriceUSDExpression } = require("../utils/salePricing");
 
 const router = express.Router();
 router.use(authMiddleware);
 router.use(requireRole("superadmin", "admin"));
 const visibleTimeframeQuery = (req) => ["admin", "superadmin"].includes(req.user?.role) ? req.query : {};
 const expenseSign = { $cond: [{ $eq: ["$transactionKind", "REVERSAL"] }, -1, 1] };
-const signedExpenseUSD = { $multiply: [expenseSign, { $ifNull: ["$amountUSD", "$amount"] }] };
+// Every amount below is FC: Sale, Expense, Entry and Product aggregations are
+// presented in FC by their model hooks (utils/currency.js).
+const signedExpense = { $multiply: [expenseSign, "$amount"] };
 
 // Activity metrics (sales count, cash taken at the till) include pending
 // reservations because their money has been received. Accounting figures -
@@ -112,7 +112,7 @@ async function aggregatePeriod(createdAt, category = null, { withAccounting = tr
               $group: {
                 _id: { productId: "$items.productId", name: "$items.name" },
                 quantity: { $sum: "$items.quantity" },
-                revenue: { $sum: { $ifNull: ["$items.revenue", { $multiply: [{ $ifNull: ["$items.priceUSD", "$items.price"] }, "$items.quantity"] }] } },
+                revenue: { $sum: { $ifNull: ["$items.revenue", { $multiply: ["$items.price", "$items.quantity"] }] } },
               },
             },
             { $sort: { quantity: -1, revenue: -1 } },
@@ -159,10 +159,10 @@ async function aggregatePeriod(createdAt, category = null, { withAccounting = tr
         $facet: {
           validated: [
             { $match: { status: "validated" } },
-            { $group: { _id: null, count: { $sum: 1 }, amount: { $sum: signedExpenseUSD } } },
+            { $group: { _id: null, count: { $sum: 1 }, amount: { $sum: signedExpense } } },
           ],
           statuses: [
-            { $group: { _id: "$status", count: { $sum: 1 }, amount: { $sum: signedExpenseUSD } } },
+            { $group: { _id: "$status", count: { $sum: 1 }, amount: { $sum: signedExpense } } },
           ],
         },
       },
@@ -195,11 +195,6 @@ async function aggregatePeriod(createdAt, category = null, { withAccounting = tr
     clothesShareholderProfit: categoryBreakdown.CLOTHES?.distributableProfit || 0,
     shoeShareholder1Profit: categoryBreakdown.SHOES?.shareholder1 || 0,
     shoeShareholder2Profit: categoryBreakdown.SHOES?.shareholder2 || 0,
-    costOfGoodsSoldFC: sumRows(categoryReports, "costOfGoodsSoldFC"),
-    grossProfitFC: sumRows(categoryReports, "grossProfitFC"),
-    clothesShareholderProfitFC: categoryBreakdown.CLOTHES?.distributableProfitFC || 0,
-    shoeShareholder1ProfitFC: categoryBreakdown.SHOES?.shareholder1FC || 0,
-    shoeShareholder2ProfitFC: categoryBreakdown.SHOES?.shareholder2FC || 0,
     categoryBreakdown,
     totalCompanyExpenses: sumRows(categoryReports, "companyExpenses"),
     totalGoodsPurchases: sumRows(categoryReports, "goodsPurchases"),
@@ -234,8 +229,10 @@ async function aggregatePeriod(createdAt, category = null, { withAccounting = tr
 
 async function aggregateDebt(range) {
   const [loanRows, repaymentRows, outstandingRows] = await Promise.all([
-    Loan.aggregate([{ $match: { borrowedAt: range } }, { $lookup: { from: "creditors", localField: "creditorId", foreignField: "_id", as: "creditor" } }, { $unwind: "$creditor" }, { $group: { _id: "$creditor.type", amount: { $sum: "$amountUSD" }, count: { $sum: 1 } } }]),
-    Expense.aggregate([{ $match: { expenseType: { $in: ["REPAYMENT", "repayment"] }, status: "validated", repaymentAppliedAt: range } }, { $group: { _id: null, amount: { $sum: "$amountUSD" }, count: { $sum: 1 } } }]),
+    // Loans always carried their exact FC amount; creditor balances are kept
+    // in FC (scripts/migrateToFcOnly.js converted the pre-cutover ones).
+    Loan.aggregate([{ $match: { borrowedAt: range } }, { $lookup: { from: "creditors", localField: "creditorId", foreignField: "_id", as: "creditor" } }, { $unwind: "$creditor" }, { $group: { _id: "$creditor.type", amount: { $sum: "$amountFC" }, count: { $sum: 1 } } }]),
+    Expense.aggregate([{ $match: { expenseType: { $in: ["REPAYMENT", "repayment"] }, status: "validated", repaymentAppliedAt: range } }, { $group: { _id: null, amount: { $sum: "$amount" }, count: { $sum: 1 } } }]),
     Creditor.aggregate([{ $group: { _id: "$type", outstanding: { $sum: "$remainingBalance" }, borrowed: { $sum: "$totalBorrowed" }, repaid: { $sum: "$totalRepaid" }, creditors: { $sum: 1 } } }])
   ]);
   return { borrowedDuringPeriod: loanRows.reduce((sum, row) => sum + row.amount, 0), repaidDuringPeriod: repaymentRows[0]?.amount || 0, repaymentCount: repaymentRows[0]?.count || 0, currentOutstanding: outstandingRows.reduce((sum, row) => sum + row.outstanding, 0), borrowedByCreditorType: loanRows, outstandingByCreditorType: outstandingRows };
@@ -259,7 +256,6 @@ router.get("/summary", async (req, res) => {
     if (chart.unit === "week") dateTrunc.startOfWeek = "monday";
 
     const visibleCategories = category ? [category] : CATEGORIES;
-    const currentRate = await getFallbackExchangeRate();
     const [current, previous, chartRows, debt, inventoryRows] = await Promise.all([
       aggregatePeriod(currentRange, category),
       aggregatePeriod(priorRange, category, { withAccounting: false }),
@@ -292,7 +288,7 @@ router.get("/summary", async (req, res) => {
           products: { $sum: 1 },
           unitsInStock: { $sum: "$stock" },
           acquisitionValue: { $sum: { $multiply: ["$stock", "$unitCost"] } },
-          retailValue: { $sum: { $multiply: ["$stock", productNormalPriceUSDExpression(currentRate)] } },
+          retailValue: { $sum: { $multiply: ["$stock", "$price"] } },
         } },
       ]),
     ]);
@@ -314,18 +310,12 @@ router.get("/summary", async (req, res) => {
     const shareholderData = isShareholderAdmin(req.user) ? {
       totalSales: current.totalSales,
       totalRevenue: current.totalRevenue,
-      totalRevenueFC: current.categoryBreakdown?.[category]?.revenueFC || 0,
       realizedRevenue: current.realizedRevenue,
       costOfGoodsSold: current.costOfGoodsSold,
-      costOfGoodsSoldFC: current.costOfGoodsSoldFC,
       grossProfit: current.grossProfit,
-      grossProfitFC: current.grossProfitFC,
       shareholderEntitlement: category === "CLOTHES"
         ? current.categoryBreakdown?.[category]?.distributableProfit || 0
         : current.categoryBreakdown?.[category]?.shareholder1 || 0,
-      shareholderEntitlementFC: category === "CLOTHES"
-        ? current.categoryBreakdown?.[category]?.distributableProfitFC || 0
-        : current.categoryBreakdown?.[category]?.shareholder1FC || 0,
       assignedCategory: category,
       entitlementRate: category === "CLOTHES" ? 1 : 0.5,
       categoryBreakdown: current.categoryBreakdown,
@@ -344,6 +334,7 @@ router.get("/summary", async (req, res) => {
       success: true,
       source: "mongodb-aggregation",
       paginated: false,
+      currency: "FC",
       // The category every figure below is restricted to (ALL = whole shop).
       // A shareholder is always pinned to its assigned category.
       scope: { category: category || "ALL", shopWideIncluded: !category },

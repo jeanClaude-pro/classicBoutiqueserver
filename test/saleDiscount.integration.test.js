@@ -3,7 +3,6 @@ const assert = require("node:assert/strict");
 const { SKIP, createIntegrationContext } = require("./helpers/integrationContext");
 const Product = require("../models/Product");
 const Sale = require("../models/Sale");
-const ExchangeRate = require("../models/ExchangeRate");
 
 const ctx = createIntegrationContext();
 test.before(ctx.setup);
@@ -49,30 +48,31 @@ itest("five distinct products and mixed quantities both qualify", async () => {
   assert.equal(mixed.status, 201, JSON.stringify(mixed.body));
 });
 
-itest("exact FC discount and historical exchange-rate snapshots survive persistence", async () => {
-  const product = await ctx.product("CLOTHES", 10000 / 2850, 20000 / 2850, 20);
-  const response = await ctx.sell(
-    [{ product, quantity: 5, price: 18000 / 2850, enteredPrice: 18000, enteredCurrency: "FC" }],
-    { exchangeRate: 2850 }
-  );
+itest("an exact FC discount is stored in francs only, with no dollar amount and no rate", async () => {
+  const product = await ctx.product("CLOTHES", 10000, 20000, 20);
+  const response = await ctx.sell([{ product, quantity: 5, enteredPrice: 18000, enteredCurrency: "FC" }]);
   assert.equal(response.status, 201, JSON.stringify(response.body));
   const sale = await Sale.findById(response.body._id).lean();
-  assert.equal(sale.exchangeRate, 2850);
-  assert.equal(sale.items[0].enteredPrice, 18000);
-  assert.equal(sale.items[0].priceFC, 18000);
-  assert.equal(sale.items[0].priceUSD, 18000 / 2850);
-  assert.equal(sale.items[0].exchangeRate, 2850);
+  assert.deepEqual([sale.currency, sale.exchangeRate, sale.total, sale.totalRevenueFC], ["FC", undefined, 90000, 90000]);
+  const [item] = sale.items;
+  assert.deepEqual([item.price, item.enteredPrice, item.enteredCurrency, item.priceFC], [18000, 18000, "FC", 18000]);
+  assert.deepEqual([item.priceUSD, item.exchangeRate], [undefined, undefined]);
+  assert.deepEqual([item.referenceUnitSellingPrice, item.discountApplied, item.discountPerUnit], [20000, true, 2000]);
 
-  await ExchangeRate.create({
-    rate: 2900,
-    createdBy: ctx.users.superadmin.user._id,
-    isActive: true,
-  });
   const history = await ctx.request("GET", "/sales?type=sale", { token: ctx.token("superadmin") });
   assert.equal(history.status, 200);
-  assert.equal(history.body.summary.revenueFC, 90000);
+  assert.deepEqual([history.body.summary.currency, history.body.summary.revenue], ["FC", 90000]);
   assert.equal(history.body.data[0].items[0].priceFC, 18000);
-  assert.equal(history.body.data[0].exchangeRate, 2850);
+  assert.equal(history.body.data[0].exchangeRate, undefined);
+});
+
+itest("a line entered in dollars is refused: the shop only records francs", async () => {
+  const product = await ctx.product("CLOTHES", 10000, 20000, 20);
+  const refused = await ctx.sell([{ product, quantity: 1, price: 7, enteredPrice: 7, enteredCurrency: "USD" }]);
+  assert.equal(refused.status, 409, JSON.stringify(refused.body));
+  assert.equal(refused.body.error, "CURRENCY_NOT_SUPPORTED");
+  assert.equal(await Sale.countDocuments(), 0);
+  assert.equal((await Product.findById(product._id)).stock, 20);
 });
 
 itest("a correction from five discounted units to four is rejected without changing stock", async () => {
@@ -86,7 +86,6 @@ itest("a correction from five discounted units to four is rejected without chang
       customer: sale.customer,
       paymentMethod: sale.paymentMethod,
       reason: "quantity correction",
-      exchangeRate: sale.exchangeRate,
       items: sale.items.map((item) => ({
         _id: item._id,
         productId: item.productId,
@@ -95,7 +94,6 @@ itest("a correction from five discounted units to four is rejected without chang
         price: item.price,
         enteredPrice: item.enteredPrice,
         enteredCurrency: item.enteredCurrency,
-        exchangeRate: item.exchangeRate,
       })),
     },
   });

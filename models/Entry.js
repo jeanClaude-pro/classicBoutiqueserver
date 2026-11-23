@@ -1,4 +1,5 @@
 const mongoose = require("mongoose");
+const { entryFCStages, fcEntry, registerFCView } = require("../utils/currency");
 
 const entrySchema = new mongoose.Schema({
   entryId: {
@@ -6,6 +7,11 @@ const entrySchema = new mongoose.Schema({
     required: true,
     unique: true
   },
+  // "FC" on every record written since the FC-only cutover. Records without
+  // it are pre-cutover USD records, presented in FC by utils/currency.js.
+  // Deliberately no default: a default would be applied to legacy documents
+  // on load and could be saved back onto a USD record.
+  currency: { type: String, enum: ["FC"], default: undefined },
   // Core entry data
   amount: {
     type: Number,
@@ -13,7 +19,8 @@ const entrySchema = new mongoose.Schema({
     min: 0
   },
   enteredAmount: { type: Number, min: 0 },
-  enteredCurrency: { type: String, enum: ["USD", "FC"], default: "USD" },
+  // Legacy values remain readable; new records are always "FC".
+  enteredCurrency: { type: String, enum: ["USD", "FC"] },
   amountUSD: { type: Number, min: 0 },
   amountFC: { type: Number, min: 0 },
   exchangeRate: { type: Number, min: 0 },
@@ -120,5 +127,7 @@ entrySchema.index(
   { requestKey: 1 },
   { name: "requestKey_unique_when_set", unique: true, partialFilterExpression: { requestKey: { $type: "string" } } }
 );
+
+registerFCView(entrySchema, { view: fcEntry, stages: entryFCStages });
 
 module.exports = mongoose.model("Entry", entrySchema);

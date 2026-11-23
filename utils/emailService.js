@@ -1,3 +1,4 @@
+const { fcExpense } = require("./currency");
 const nodemailer = require("nodemailer");
 const { escapeHtml, htmlSafeRecord } = require("../utils/html");
 const User = require("../models/User");
@@ -13,8 +14,9 @@ const transporter = nodemailer.createTransport({
 // ✅ CONFIGURATION DE L'ENTREPRISE
 const COMPANY_NAME = "ETS DOUBLE M CLASSIC BOUTIQUE";
 const COMPANY_SLOGAN = "Votre Partenaire de Confiance";
-const COMPANY_COLOR = "#1e40af";
-const COMPANY_SECONDARY_COLOR = "#dc2626";
+// Brand palette: Navy Blue / Emerald Green.
+const COMPANY_COLOR = "#0B1C2D";
+const COMPANY_SECONDARY_COLOR = "#1F7A63";
 
 // Return only active superadministrators. Never log account details or notify
 // inactive accounts: those are security-sensitive production data.
@@ -55,10 +57,8 @@ async function sendEmailToRecipients(expense, recipientEmails) {
   const safe = htmlSafeRecord(expense);
   try {
     // Formater le montant en devise
-    const formattedAmount = new Intl.NumberFormat("fr-FR", {
-      style: "currency",
-      currency: "USD",
-    }).format(expense.amount);
+    const amountFC = Number(fcExpense(typeof expense?.toObject === "function" ? expense.toObject() : expense)?.amount);
+    const formattedAmount = `${new Intl.NumberFormat("fr-FR", { maximumFractionDigits: 0 }).format(Number.isFinite(amountFC) ? amountFC : 0)} FC`;
 
     // Traduire le statut
     const statusTranslations = {

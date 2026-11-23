@@ -193,7 +193,7 @@ test("odd cents are split deterministically without creating or losing money", (
   assert.deepEqual([row.shareholder1, row.shareholder2], [0.03, 0.02]);
 });
 
-test("small, awkward and large USD amounts stay exact in cents", () => {
+test("small, awkward and large FC amounts stay exact to the hundredth", () => {
   for (const amount of [0.01, 0.05, 0.1, 10.99, 999999.99]) {
     const row = shoes({ revenue: amount * 3, costOfGoodsSold: amount * 2, goodsPurchases: amount });
     assertIdentities(row);
@@ -202,7 +202,7 @@ test("small, awkward and large USD amounts stay exact in cents", () => {
   const big = clothes({ revenue: 999999.99 * 10, costOfGoodsSold: 999999.99 * 6, companyExpenses: 0.01 });
   assertIdentities(big);
   assert.equal(big.netProfit, 3999999.95);
-  assert.throws(() => purchaseSnapshot(shoes({ costOfGoodsSold: 1 }), 0.004), /at least 0.01/);
+  assert.throws(() => purchaseSnapshot(shoes({ costOfGoodsSold: 1 }), 0.004), /greater than 0 FC/);
 });
 
 test("repeated 0.1 additions do not drift", () => {

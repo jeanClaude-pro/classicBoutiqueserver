@@ -88,11 +88,15 @@ itest("password confirmation never opens a session, is throttled and binds the p
   const ok = await ctx.request("POST", "/auth/reauth", { token: sessionA, body: { password }, reauth: false });
   assert.equal(ok.status, 200, JSON.stringify(ok.body));
   assert.equal(ok.body.token, undefined, "no new session token is issued");
-  assert.ok(ok.body.reauthToken);
+  assert.equal(ok.body.reauthToken, undefined, "the proof is only in an httpOnly cookie");
+  assert.ok(!ok.setCookies.some((cookie) => cookie.startsWith("cb_session=")), "no new session cookie");
+  const proofCookie = ok.setCookies.find((cookie) => cookie.startsWith("cb_reauth="));
+  assert.match(proofCookie, /HttpOnly/i);
+  const proof = decodeURIComponent(proofCookie.split(";")[0].slice("cb_reauth=".length));
 
-  const withProof = await ctx.request("GET", "/analytics/summary?timeframe=day", { token: sessionA, reauth: ok.body.reauthToken });
+  const withProof = await ctx.request("GET", "/analytics/summary?timeframe=day", { token: sessionA, reauth: proof });
   assert.equal(withProof.status, 200);
-  const otherSession = await ctx.request("GET", "/analytics/summary?timeframe=day", { token: sessionB, reauth: ok.body.reauthToken });
+  const otherSession = await ctx.request("GET", "/analytics/summary?timeframe=day", { token: sessionB, reauth: proof });
   assert.equal(otherSession.status, 403, "a proof only works for the session that confirmed the password");
 
   // Repeated wrong passwords lock the account exactly like the login form.

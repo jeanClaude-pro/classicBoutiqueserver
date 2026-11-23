@@ -93,20 +93,17 @@ test("keeps shoe shareholder entitlements mathematically equal for a half-cent",
   assert.equal(result.shoeShareholder1Profit + result.shoeShareholder2Profit, result.grossProfit);
 });
 
-test("uses the USD snapshot produced from an FC custom price", () => {
-  const pricing = normalizeSaleItemPricing(
-    { enteredPrice: 10500, enteredCurrency: "FC" },
-    3000
-  );
+test("profit is computed in FC from an FC custom price", () => {
+  const pricing = normalizeSaleItemPricing({ enteredPrice: 10500, enteredCurrency: "FC" });
   const result = calculateProfitSnapshot({
     unitSellingPrice: pricing.price,
-    unitAcquisitionCost: 2,
+    unitAcquisitionCost: 6000,
     quantity: 2,
     mainCategory: "CLOTHES",
   });
-  assert.equal(result.unitSellingPrice, 3.5);
-  assert.equal(result.revenue, 7);
-  assert.equal(result.grossProfit, 3);
+  assert.equal(result.unitSellingPrice, 10500);
+  assert.equal(result.revenue, 21000);
+  assert.equal(result.grossProfit, 9000);
 });
 
 test("aggregates immutable line snapshots without floating point drift", () => {

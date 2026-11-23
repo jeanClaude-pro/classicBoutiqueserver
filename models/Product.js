@@ -1,4 +1,5 @@
 const mongoose = require("mongoose");
+const { fcProduct, productFCStages, registerFCView } = require("../utils/currency");
 
 const productSchema = new mongoose.Schema(
   {
@@ -31,16 +32,16 @@ const productSchema = new mongoose.Schema(
       type: String,
       default: "",
     },
-    // Selling price: priceEnteredCurrency/priceEnteredAmount are the
-    // authoritative normal price (see productNormalPrice in
-    // utils/salePricing.js). A price defined as 20,000 FC stays 20,000 FC
-    // whatever the rate; `price` is then only its USD value at
-    // priceExchangeRate, and a new sale derives USD at its own rate. A USD
-    // price (or a legacy product without priceEnteredCurrency) keeps `price`
-    // exact and derives FC at the sale's rate.
-    // unitCost remains the canonical USD acquisition cost every profit
-    // calculation reads from; its entered-currency fields follow the same
-    // enteredAmount/enteredCurrency/amountFC/exchangeRate snapshot pattern.
+    // Since the FC-only cutover `price` (normal selling price) and `unitCost`
+    // (acquisition cost of one piece) are francs, and their *FC /
+    // *Entered* fields mirror them. A product not yet converted by
+    // scripts/migrateToFcOnly.js is still read in FC through its own FC
+    // snapshot (utils/currency.js: productPriceFC / productUnitCostFC).
+    // "FC" on every record written since the FC-only cutover. Records without
+    // it are pre-cutover USD records, presented in FC by utils/currency.js.
+    // Deliberately no default: a default would be applied to legacy documents
+    // on load and could be saved back onto a USD record.
+    currency: { type: String, enum: ["FC"], default: undefined },
     price: {
       type: Number,
       min: 0.01,
@@ -108,6 +109,8 @@ const productSchema = new mongoose.Schema(
 productSchema.index({ name: "text", description: "text", brand: "text" });
 productSchema.index({ category: 1 });
 productSchema.index({ status: 1, createdAt: -1 });
+
+registerFCView(productSchema, { view: fcProduct, stages: productFCStages });
 
 // Reuse if it already exists (prevents OverwriteModelError)
 const Product =

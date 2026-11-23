@@ -12,7 +12,8 @@
     "migrate:expense-accounting": "node scripts/migrateExpenseAccounting.js",
     "seed:categories": "node scripts/seedCategories.js",
     "migrate:shop-number": "node scripts/updateShopNumber.js",
-    "migrate:stock-ledger": "node scripts/migrateStockLedger.js"
+    "migrate:stock-ledger": "node scripts/migrateStockLedger.js",
+    "migrate:fc-only": "node scripts/migrateToFcOnly.js"
   },
   "keywords": [
     "erp"

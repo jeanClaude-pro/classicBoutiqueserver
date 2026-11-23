@@ -6,6 +6,9 @@ const creditorSchema = new mongoose.Schema({
   phone: { type: String, trim: true, default: "" },
   address: { type: String, trim: true, default: "" },
   isActive: { type: Boolean, default: true, index: true },
+  // Balances are in FC. "FC" marks a creditor whose balances were converted
+  // (or created) after the FC-only cutover; see scripts/migrateToFcOnly.js.
+  currency: { type: String, enum: ["FC"], default: undefined },
   totalBorrowed: { type: Number, min: 0, default: 0 },
   totalRepaid: { type: Number, min: 0, default: 0 },
   remainingBalance: { type: Number, min: 0, default: 0 },

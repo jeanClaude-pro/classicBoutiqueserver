@@ -9,7 +9,6 @@ const MODULES = Object.freeze({
   CUSTOMERS: "/customers",
   ENTRIES: "/entryhistory",
   EXPENSES: "/sortiehistory",
-  EXCHANGE_RATES: "/rate",
   DEBTS: "/remboursements",
 });
 const SHAREHOLDER_ALLOWED_MODULES = new Set([

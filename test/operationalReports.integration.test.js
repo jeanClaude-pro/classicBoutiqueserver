@@ -78,13 +78,12 @@ itest("stock sheet derives opening, period changes and closing from the ledger a
 });
 
 itest("the stock sheet API reflects real product, sale and void workflows", async () => {
-  await ctx.setRate(2850);
   const created = await ctx.request("POST", "/products", {
     token: ctx.token("superadmin"),
     body: {
       name: "Robe flux", mainCategory: "CLOTHES", subcategory: "Robes", purchasedQuantity: 10, stock: 10,
-      priceEnteredAmount: 20, priceEnteredCurrency: "USD", priceExchangeRate: 2850,
-      unitCostEnteredAmount: 10, unitCostEnteredCurrency: "USD", unitCostExchangeRate: 2850,
+      priceEnteredAmount: 20000, priceEnteredCurrency: "FC",
+      unitCostEnteredAmount: 10000, unitCostEnteredCurrency: "FC",
     },
   });
   assert.equal(created.status, 201, JSON.stringify(created.body));
@@ -93,10 +92,10 @@ itest("the stock sheet API reflects real product, sale and void workflows", asyn
   assert.equal((await edit(15)).status, 200);
   assert.equal((await edit(12)).status, 200);
   const product = await Product.findById(id);
-  const sold = await ctx.sell([{ product, quantity: 4 }], { exchangeRate: 2850 });
+  const sold = await ctx.sell([{ product, quantity: 4 }]);
   assert.equal(sold.status, 201, JSON.stringify(sold.body));
   assert.equal((await ctx.request("PATCH", `/sales/${sold.body._id}/void`, { token: ctx.token("superadmin"), body: { reason: "test" } })).status, 200);
-  assert.equal((await ctx.sell([{ product, quantity: 2 }], { exchangeRate: 2850 })).status, 201);
+  assert.equal((await ctx.sell([{ product, quantity: 2 }])).status, 201);
 
   const today = currentBusinessDate();
   const response = await stockSheet(`from=${today}&to=${today}&category=CLOTHES`);
@@ -110,11 +109,10 @@ itest("the stock sheet API reflects real product, sale and void workflows", asyn
 });
 
 itest("category transfers and deletions keep CLOTHES and SHOES streams separate", async () => {
-  await ctx.setRate(2850);
   const body = (name) => ({
     name, mainCategory: "CLOTHES", subcategory: "Test", purchasedQuantity: 8, stock: 8,
-    priceEnteredAmount: 20, priceEnteredCurrency: "USD", priceExchangeRate: 2850,
-    unitCostEnteredAmount: 10, unitCostEnteredCurrency: "USD", unitCostExchangeRate: 2850,
+    priceEnteredAmount: 20000, priceEnteredCurrency: "FC",
+    unitCostEnteredAmount: 10000, unitCostEnteredCurrency: "FC",
   });
   const moved = await ctx.request("POST", "/products", { token: ctx.token("superadmin"), body: body("Moved") });
   const removed = await ctx.request("POST", "/products", { token: ctx.token("superadmin"), body: body("Removed") });
@@ -186,15 +184,15 @@ itest("report endpoints reject invalid dates and unauthenticated access", async 
 itest("sales sheet counts recognized sales only and isolates shareholder categories", async () => {
   const clothes = await ctx.product("CLOTHES", 10, 20, 20);
   const shoes = await ctx.product("SHOES", 10, 20, 20);
-  await ctx.sell([{ product: clothes, quantity: 2 }], { exchangeRate: 2850 });
-  await ctx.sell([{ product: shoes, quantity: 1 }], { exchangeRate: 2850 });
-  await ctx.sell([{ product: shoes, quantity: 3 }], { type: "reservation", exchangeRate: 2850, customer: { name: "Client", phone: "0992000001" } });
+  await ctx.sell([{ product: clothes, quantity: 2 }]);
+  await ctx.sell([{ product: shoes, quantity: 1 }]);
+  await ctx.sell([{ product: shoes, quantity: 3 }], { type: "reservation", customer: { name: "Client", phone: "0992000001" } });
   const superadmin = await salesSheet("from=2020-01-01&to=2030-01-01");
   assert.equal(superadmin.status, 200);
   assert.equal(superadmin.body.summary.unitsSold, 3, "pending reservation is excluded");
   assert.equal(superadmin.body.summary.skusSold, 2);
   const clothesRow = superadmin.body.rows.find((row) => row.productId === String(clothes._id));
-  assert.deepEqual([clothesRow.quantitySold, clothesRow.unit, clothesRow.revenue.usd, clothesRow.revenue.fc], [2, "pcs", 40, 114000]);
+  assert.deepEqual([clothesRow.quantitySold, clothesRow.unit, clothesRow.revenue.fc, clothesRow.revenue.usd], [2, "pcs", 40, undefined]);
 
   const shareholder = await salesSheet("from=2020-01-01&to=2030-01-01&category=SHOES", "clothesShareholder");
   assert.equal(shareholder.status, 200);
@@ -207,18 +205,18 @@ itest("sales sheet counts recognized sales only and isolates shareholder categor
 itest("a mixed CLOTHES/SHOES sale only contributes the requested category's lines", async () => {
   const clothes = await ctx.product("CLOTHES", 10, 20, 20);
   const shoes = await ctx.product("SHOES", 10, 20, 20);
-  await ctx.sell([{ product: clothes, quantity: 1 }, { product: shoes, quantity: 4 }], { exchangeRate: 2850 });
+  await ctx.sell([{ product: clothes, quantity: 1 }, { product: shoes, quantity: 4 }]);
   const response = await salesSheet("from=2020-01-01&to=2030-01-01&category=SHOES");
   assert.deepEqual(response.body.rows.map((row) => [row.productId, row.quantitySold]), [[String(shoes._id), 4]]);
 });
 
 itest("sales sheet uses recognition dates and excludes voided, refunded and corrected records", async () => {
   const product = await ctx.product("CLOTHES", 10, 20, 40);
-  const completed = await ctx.sell([{ product, quantity: 2 }], { exchangeRate: 2850, requestKey: "report-completed" });
-  const pending = await ctx.sell([{ product, quantity: 3 }], { type: "reservation", exchangeRate: 2850, customer: { name: "Client", phone: "0992000002" } });
-  const voided = await ctx.sell([{ product, quantity: 4 }], { exchangeRate: 2850, requestKey: "report-voided" });
-  const refunded = await ctx.sell([{ product, quantity: 5 }], { exchangeRate: 2850, requestKey: "report-refunded" });
-  const corrected = await ctx.sell([{ product, quantity: 6 }], { exchangeRate: 2850, requestKey: "report-corrected" });
+  const completed = await ctx.sell([{ product, quantity: 2 }], { requestKey: "report-completed" });
+  const pending = await ctx.sell([{ product, quantity: 3 }], { type: "reservation", customer: { name: "Client", phone: "0992000002" } });
+  const voided = await ctx.sell([{ product, quantity: 4 }], { requestKey: "report-voided" });
+  const refunded = await ctx.sell([{ product, quantity: 5 }], { requestKey: "report-refunded" });
+  const corrected = await ctx.sell([{ product, quantity: 6 }], { requestKey: "report-corrected" });
   const day10 = new Date("2026-09-10T10:00:00Z");
   const day11 = new Date("2026-09-11T10:00:00Z");
   const objectId = (value) => new mongoose.Types.ObjectId(value);
@@ -235,7 +233,7 @@ itest("sales sheet uses recognition dates and excludes voided, refunded and corr
 
 itest("a voided sale disappears from the sales sheet through the real void workflow", async () => {
   const product = await ctx.product("CLOTHES", 10, 20, 10);
-  const sold = await ctx.sell([{ product, quantity: 3 }], { exchangeRate: 2850 });
+  const sold = await ctx.sell([{ product, quantity: 3 }]);
   const today = currentBusinessDate();
   assert.equal((await salesSheet(`from=${today}&to=${today}`)).body.summary.unitsSold, 3);
   await ctx.request("PATCH", `/sales/${sold.body._id}/void`, { token: ctx.token("superadmin"), body: { reason: "test" } });
@@ -246,7 +244,7 @@ itest("sales sheet date boundaries are inclusive to the millisecond in business 
   const product = await ctx.product("CLOTHES", 10, 20, 40);
   const objectId = (value) => new mongoose.Types.ObjectId(value);
   const at = async (iso, quantity) => {
-    const sale = await ctx.sell([{ product, quantity }], { exchangeRate: 2850 });
+    const sale = await ctx.sell([{ product, quantity }]);
     await Sale.collection.updateOne({ _id: objectId(sale.body._id) }, { $set: { createdAt: new Date(iso) } });
   };
   await at("2026-09-09T21:59:59.999Z", 1); // business day 2026-09-09
@@ -260,11 +258,10 @@ itest("sales sheet date boundaries are inclusive to the millisecond in business 
 
 itest("an offline sale synchronised several times is counted once", async () => {
   const product = await ctx.product("SHOES", 10, 20, 20);
-  await ctx.setRate(2850);
   const body = {
-    isWalkIn: true, paymentMethod: "cash", exchangeRate: 2850, requestKey: "offline-sync-1", clientSaleId: "offline-sync-1",
+    isWalkIn: true, paymentMethod: "cash", requestKey: "offline-sync-1", clientSaleId: "offline-sync-1",
     offline: true, occurredAt: new Date().toISOString(),
-    items: [{ productId: String(product._id), quantity: 2, price: 20, enteredPrice: 20, enteredCurrency: "USD", exchangeRate: 2850 }],
+    items: [{ productId: String(product._id), quantity: 2, price: 20, enteredPrice: 20, enteredCurrency: "FC" }],
   };
   const first = await ctx.request("POST", "/sales", { token: ctx.token("staff"), body });
   const retry = await ctx.request("POST", "/sales", { token: ctx.token("staff"), body });

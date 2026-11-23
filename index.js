@@ -12,7 +12,8 @@ const { repairReversalIndex } = require("./scripts/migrateExpenseAccounting");
 const { MODULES, blockShareholderMutations, requireAssignedCategory, requireShareholderModule } = require("./middleware/authorization");
 const { requireModuleAccess } = require("./middleware/moduleAccess");
 const { productStockSheet, stockSheet, salesSheet } = require("./routes/operationalReports");
-const { REAUTH_HEADER, requireReportsReauth } = require("./middleware/reauth");
+const { requireReportsReauth } = require("./middleware/reauth");
+const { configuredOrigins, trustedClientOnly } = require("./middleware/trustedClient");
 const { rateLimit } = require("express-rate-limit");
 
 const app = express();
@@ -27,6 +28,12 @@ if (missingSecrets.length) {
 }
 if (process.env.JWT_SECRET.length < 32) {
   console.error("Server configuration error: JWT_SECRET must be at least 32 characters");
+  process.exit(1);
+}
+// In production the API only answers requests forwarded (and signed) by the
+// shop's Netlify site. The same value is set on Netlify as API_PROXY_SIGNATURE.
+if (isProduction && String(process.env.PROXY_SIGNING_SECRET || "").length < 32) {
+  console.error("Server configuration error: PROXY_SIGNING_SECRET (at least 32 characters) is required in production");
   process.exit(1);
 }
 
@@ -53,9 +60,7 @@ app.use(morgan("combined"));
 app.use(preventNoSqlInjection);
 
 // Allow configured origins with explicit headers so Authorization is preserved.
-const configuredOrigins = (process.env.CLIENT_URL || "").split(",").map((value) => value.trim().replace(/\/$/, "")).filter(Boolean);
-const developmentOrigins = ["http://localhost:5173", "http://127.0.0.1:5173"];
-const allowedOrigins = new Set(isProduction ? configuredOrigins : [...developmentOrigins, ...configuredOrigins]);
+const allowedOrigins = configuredOrigins({ isProduction });
 if (isProduction && allowedOrigins.size === 0) {
   console.error("Server configuration error: CLIENT_URL is required in production");
   process.exit(1);
@@ -63,11 +68,11 @@ if (isProduction && allowedOrigins.size === 0) {
 
 app.use(cors({
   origin(origin, callback) {
-    if (!origin || allowedOrigins.has(origin.replace(/\/$/, ""))) return callback(null, true);
+    if (!origin || allowedOrigins.has(origin.replace(/\/$/, "").toLowerCase())) return callback(null, true);
     return callback(new Error("Origin not allowed by CORS"));
   },
   methods: ["GET", "HEAD", "PUT", "PATCH", "POST", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Authorization", "Content-Type", "Accept", "X-Requested-With", REAUTH_HEADER],
+  allowedHeaders: ["Content-Type", "Accept", "X-Requested-With"],
   credentials: false,
   optionsSuccessStatus: 200,
 }));
@@ -114,6 +119,11 @@ app.use("/api", (_req, res, next) => {
   next();
 });
 
+// Only the shop's site (CLIENT_URL, through the signed Netlify proxy) may call
+// the API; see middleware/trustedClient.js. Runs before the rate limits so
+// they count the real visitor IP.
+app.use("/api", trustedClientOnly({ allowedOrigins }));
+
 // General abuse limit for the whole API (login and sign-up keep their own,
 // much stricter limits). Generous enough for several tills sharing the
 // shop's public IP; no rate-limit headers, so the window is not revealed.
@@ -152,7 +162,9 @@ app.use("/api/categories", ...guarded([MODULES.PRODUCTS]), require("./routes/cat
 // Printing a receipt belongs to the POS and Sales History pages only.
 app.use('/api/print', ...guarded([MODULES.SALES_HISTORY]), requireModuleAccess("/", "/sales"), printRoutes);
 app.use("/api/expenses", ...guarded([MODULES.EXPENSES]), require("./routes/expenses"));
-app.use("/api/exchange-rates", ...guarded([MODULES.EXCHANGE_RATES]), require("./routes/exchangeRates"));
+// The exchange-rate module was retired with the FC-only cutover. Its route
+// answers 410 so a till still running an old interface gets a clear signal.
+app.use("/api/exchange-rates", (_req, res) => res.status(410).json({ error: "EXCHANGE_RATES_RETIRED", message: "L'application fonctionne uniquement en francs congolais (FC). Actualisez la page." }));
 app.use("/api/entries", ...guarded([MODULES.ENTRIES]), require("./routes/entries"));
 app.use("/api/settings", ...guarded([MODULES.REPORTS, MODULES.SALES_HISTORY]), require("./routes/settings"));
 app.use("/api/analytics", ...guarded([MODULES.REPORTS], true), requireReportsReauth, require("./routes/analytics"));
@@ -186,6 +198,15 @@ mongoose
       if (droppedBrokenReversalIndex) console.log("Dropped obsolete expenses index reversalOf_1");
     } catch (error) {
       console.error("Expense index repair failed:", error.message);
+    }
+    // FC-only cutover: the catalogue must be converted once (see
+    // scripts/migrateToFcOnly.js). Until then products are read through their
+    // own FC snapshot, which may differ from the price the till last used.
+    try {
+      const unconverted = await mongoose.connection.db.collection("products").countDocuments({ currency: { $ne: "FC" } });
+      if (unconverted) console.warn(`⚠️  ${unconverted} product(s) not yet converted to FC: run "npm run migrate:fc-only -- --apply"`);
+    } catch (error) {
+      console.error("FC catalogue check failed:", error.message);
     }
     console.log("✅ Connected to MongoDB Atlas");
     app.listen(PORT, () => {

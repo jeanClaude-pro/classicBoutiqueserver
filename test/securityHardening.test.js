@@ -10,7 +10,9 @@ test("protected business routers enforce server-side authentication", () => {
   assert.match(read("routes/categories.js"), /router\.use\(authMiddleware\)/);
   assert.match(read("routes/customers.js"), /router\.use\(authMiddleware\)/);
   assert.match(read("routes/products.js"), /router\.get\("\/", authMiddleware/);
-  assert.match(read("routes/exchangeRates.js"), /router\.get\("\/current", authMiddleware/);
+  // The exchange-rate module was retired with the FC-only cutover.
+  assert.equal(fs.existsSync(path.join(__dirname, "..", "routes/exchangeRates.js")), false);
+  assert.match(read("index.js"), /EXCHANGE_RATES_RETIRED/);
 });
 
 test("login is rate limited and password hashes are excluded by default", () => {

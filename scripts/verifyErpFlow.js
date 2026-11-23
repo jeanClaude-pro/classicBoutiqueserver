@@ -50,8 +50,8 @@ async function verifyErpFlow() {
   const headers = { "Content-Type": "application/json", Authorization: `Bearer ${login.token}` };
 
   const productBodies = [
-    { name: `E2E Clothes ${runId}`, mainCategory: "CLOTHES", subcategory: "Test clothes", purchasedQuantity: 10, unitCost: 10, price: 20, stock: 10 },
-    { name: `E2E Shoes ${runId}`, mainCategory: "SHOES", subcategory: "Test shoes", purchasedQuantity: 8, unitCost: 20, price: 40, stock: 8 },
+    { name: `E2E Clothes ${runId}`, mainCategory: "CLOTHES", subcategory: "Test clothes", purchasedQuantity: 10, unitCost: 10000, price: 20000, stock: 10 },
+    { name: `E2E Shoes ${runId}`, mainCategory: "SHOES", subcategory: "Test shoes", purchasedQuantity: 8, unitCost: 20000, price: 40000, stock: 8 },
   ];
   for (const productBody of productBodies) {
     const product = await request("/products", { method: "POST", headers, body: JSON.stringify(productBody) });
@@ -74,21 +74,23 @@ async function verifyErpFlow() {
       paymentMethod: "cash",
       salesPerson: login.user.username,
       type: "sale",
-      exchangeRate: 2800,
+      // Every amount is FC (the only currency since the FC-only cutover).
+      // 18,000 FC is a discount on the 20,000 FC clothes line, which needs
+      // 5 pieces in the cart: 5 clothes + 1 pair of shoes.
       items: [
-        { productId: productIds[0], name: productBodies[0].name, quantity: 2, price: 18, enteredPrice: 18, enteredCurrency: "USD", priceUSD: 18, exchangeRate: 2800 },
-        { productId: productIds[1], name: productBodies[1].name, quantity: 1, price: 40, enteredPrice: 112000, enteredCurrency: "FC", priceFC: 112000, exchangeRate: 2800 },
+        { productId: productIds[0], name: productBodies[0].name, quantity: 5, price: 18000, enteredPrice: 18000, enteredCurrency: "FC" },
+        { productId: productIds[1], name: productBodies[1].name, quantity: 1, price: 40000, enteredPrice: 40000, enteredCurrency: "FC" },
       ],
     }),
   });
   saleId = sale._id;
-  const expected = { totalRevenue: 76, costOfGoodsSold: 40, grossProfit: 36, shopProfit: 26, partnerProfit: 10 };
+  const expected = { currency: "FC", totalRevenue: 130000, costOfGoodsSold: 70000, grossProfit: 60000, shopProfit: 50000, partnerProfit: 10000 };
   for (const [field, value] of Object.entries(expected)) {
     if (sale[field] !== value) throw new Error(`Unexpected ${field}: expected ${value}, received ${sale[field]}`);
   }
 
   const afterSale = await Promise.all(productIds.map((id) => request(`/products/${id}`, { headers })));
-  if (afterSale[0].stock !== 8 || afterSale[1].stock !== 7) throw new Error("Sale did not decrease stock correctly");
+  if (afterSale[0].stock !== 5 || afterSale[1].stock !== 7) throw new Error("Sale did not decrease stock correctly");
 
   const sales = await request("/sales?type=sale&limit=50", { headers });
   if (!sales.data?.some((entry) => entry._id === saleId)) throw new Error("Created sale was not returned by the sales API");
@@ -103,7 +105,7 @@ async function verifyErpFlow() {
     productIds.splice(productIds.indexOf(id), 1);
   }
 
-  console.log("E2E ERP flow passed: login/JWT, CLOTHES+SHOES creation, USD/FC sale, stock, profit, list and cleanup.");
+  console.log("E2E ERP flow passed: login/JWT, CLOTHES+SHOES creation, FC sale, stock, profit, list and cleanup.");
 }
 
 verifyErpFlow()

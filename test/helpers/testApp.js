@@ -12,12 +12,18 @@ const { MODULES, blockShareholderMutations, requireAssignedCategory, requireShar
 const { requireModuleAccess } = require("../../middleware/moduleAccess");
 const User = require("../../models/User");
 const { productStockSheet, stockSheet, salesSheet } = require("../../routes/operationalReports");
-const { REAUTH_HEADER, issueReauthToken, requireReportsReauth } = require("../../middleware/reauth");
+const { issueReauthToken, requireReportsReauth } = require("../../middleware/reauth");
+const { trustedClientOnly } = require("../../middleware/trustedClient");
+const { REAUTH_COOKIE, SESSION_COOKIE } = require("../../utils/sessionCookies");
+
+// The browser origin every test request comes from (allowed outside production).
+const TEST_ORIGIN = "http://localhost:5173";
 
 function createApp() {
   const app = express();
   app.use(express.json());
   app.use(preventNoSqlInjection);
+  app.use("/api", trustedClientOnly());
   const guarded = (modules, categorySensitive = false) => [
     authMiddleware,
     requireShareholderModule(...modules),
@@ -37,7 +43,8 @@ function createApp() {
   app.use("/api/auth", require("../../routes/auth"));
   app.use("/api/audit-logs", require("../../routes/auditLogs"));
   app.use("/api/settings", ...guarded([MODULES.REPORTS, MODULES.SALES_HISTORY]), require("../../routes/settings"));
-  app.use("/api/exchange-rates", ...guarded([MODULES.EXCHANGE_RATES]), require("../../routes/exchangeRates"));
+  // Retired with the FC-only cutover (same answer as index.js).
+  app.use("/api/exchange-rates", (_req, res) => res.status(410).json({ error: "EXCHANGE_RATES_RETIRED" }));
   app.use("/api/creditors", ...guarded([MODULES.DEBTS]), require("../../routes/creditors"));
   return app;
 }
@@ -57,24 +64,31 @@ async function startApp() {
   const base = `http://127.0.0.1:${server.address().port}/api`;
   return {
     base,
-    // Reports require a password confirmation proof for the superadmin. Tests
-    // get a valid proof for their session by default; pass reauth: false to
-    // test the refusal, or a string to send a specific proof.
-    async request(method, url, { token, body, reauth = true } = {}) {
+    // The session travels in its httpOnly cookie, exactly like a browser.
+    // Reports require a password confirmation proof (cookie) for the
+    // superadmin: tests get a valid one by default; pass reauth: false to test
+    // the refusal, or a string to send a specific proof. `origin: null` sends
+    // no Origin header; `headers` adds or overrides headers.
+    async request(method, url, { token, body, reauth = true, origin = TEST_ORIGIN, headers = {} } = {}) {
       const proof = typeof reauth === "string" ? reauth : reauth && token ? reauthProofFor(token) : null;
+      const cookies = [
+        ...(token ? [`${SESSION_COOKIE}=${encodeURIComponent(token)}`] : []),
+        ...(proof ? [`${REAUTH_COOKIE}=${encodeURIComponent(proof)}`] : []),
+      ];
       const response = await fetch(`${base}${url}`, {
         method,
         headers: {
           "Content-Type": "application/json",
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
-          ...(proof ? { [REAUTH_HEADER]: proof } : {}),
+          ...(origin ? { Origin: origin } : {}),
+          ...(cookies.length ? { Cookie: cookies.join("; ") } : {}),
+          ...headers,
         },
         body: body === undefined ? undefined : JSON.stringify(body),
       });
       const text = await response.text();
       let json = null;
       try { json = text ? JSON.parse(text) : null; } catch { json = text; }
-      return { status: response.status, body: json, headers: Object.fromEntries(response.headers) };
+      return { status: response.status, body: json, headers: Object.fromEntries(response.headers), setCookies: response.headers.getSetCookie() };
     },
     close: () => new Promise((resolve) => server.close(resolve)),
   };
@@ -91,4 +105,13 @@ async function createUser(role, extra = {}) {
   return { user, token: jwt.sign({ id: user._id.toString() }, process.env.JWT_SECRET) };
 }
 
-module.exports = { createApp, startApp, createUser, reauthProofFor };
+/** The session token a login response set in its cookie (null if none). */
+function sessionTokenFrom(response) {
+  for (const cookie of response.setCookies || []) {
+    const match = cookie.match(new RegExp(`^${SESSION_COOKIE}=([^;]*)`));
+    if (match && match[1]) return decodeURIComponent(match[1]);
+  }
+  return null;
+}
+
+module.exports = { createApp, startApp, createUser, reauthProofFor, sessionTokenFrom, TEST_ORIGIN };

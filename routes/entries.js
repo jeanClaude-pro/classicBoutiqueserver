@@ -3,8 +3,8 @@ const router = express.Router();
 const mongoose = require("mongoose");
 const Entry = require("../models/Entry");
 const authMiddleware = require("../middleware/auth");
-const { normalizeAmountSnapshot } = require("../utils/salePricing");
-const { getFallbackExchangeRate } = require("../utils/currentExchangeRate");
+const { CurrencyError, normalizeAmountSnapshot } = require("../utils/salePricing");
+const { CURRENCY, fcEntry } = require("../utils/currency");
 const {
   buildTimeframeFilter: buildBusinessTimeframeFilter,
   paginationMetadata,
@@ -201,11 +201,8 @@ function entryAuditSnapshot(entry) {
   return {
     entryId: value.entryId,
     status: value.status,
-    amountUSD: value.amountUSD ?? value.amount,
-    amountFC: value.amountFC,
-    enteredAmount: value.enteredAmount,
-    enteredCurrency: value.enteredCurrency,
-    exchangeRate: value.exchangeRate,
+    currency: CURRENCY,
+    amount: fcEntry(value).amount,
     source: value.source,
     category: value.category,
     paymentMethod: value.paymentMethod,
@@ -219,14 +216,13 @@ function entryAuditSnapshot(entry) {
 // key reused for a different entry is refused instead of silently ignored.
 function replayEntryRequest(res, req, existing) {
   const sameAuthor = String(existing.createdBy) === String(req.user.userId);
+  // `existing` is a lean read, so its amount is already in FC.
   const submitted = Number(req.body?.enteredAmount ?? req.body?.amount);
-  const recorded = Number(existing.enteredAmount ?? existing.amount);
-  const sameMoney = Math.round(submitted * 100) === Math.round(recorded * 100) &&
-    (req.body?.enteredCurrency || "USD") === (existing.enteredCurrency || "USD");
+  const sameMoney = Math.round(submitted * 100) === Math.round(Number(existing.amount) * 100);
   if (!sameAuthor || !sameMoney) {
     return res.status(409).json({ error: "IDEMPOTENCY_CONFLICT", message: "Cette clé de requête a déjà été utilisée avec des données différentes." });
   }
-  return res.status(200).json(existing);
+  return res.status(200).json(fcEntry(existing));
 }
 
 // ==================== MAIN ENTRIES ENDPOINT (TIME FRAME PAGINATION) ====================
@@ -476,12 +472,9 @@ router.post("/", authMiddleware, requireModuleAccess("/entry"), async (req, res)
     const normalizedPM = normalizePaymentMethod(paymentMethod);
     let amountSnapshot;
     try {
-      amountSnapshot = normalizeAmountSnapshot(
-        req.body,
-        await getFallbackExchangeRate()
-      );
+      amountSnapshot = normalizeAmountSnapshot(req.body);
     } catch (snapshotError) {
-      return res.status(400).json({ error: snapshotError.message });
+      return res.status(snapshotError instanceof CurrencyError ? 409 : 400).json({ error: snapshotError.message, code: snapshotError.code });
     }
 
     // Generate unique entry ID (like your saleId)
@@ -519,7 +512,7 @@ router.post("/", authMiddleware, requireModuleAccess("/entry"), async (req, res)
       await session.endSession();
     }
 
-    return res.status(201).json(savedEntry);
+    return res.status(201).json(fcEntry(savedEntry.toObject()));
   } catch (error) {
     if (error?.code === 11000 && requestKey) {
       // A concurrent identical submission committed first: replay it.
@@ -546,7 +539,8 @@ router.get("/:id", authMiddleware, async (req, res) => {
     })
       .populate("createdBy", "username email")
       .populate("updatedBy", "username")
-      .populate("editHistory.editedBy", "username email");
+      .populate("editHistory.editedBy", "username email")
+      .lean();
 
     if (!entry) {
       return res.status(404).json({ error: "Entry not found" });
@@ -605,8 +599,8 @@ router.put("/:id", authMiddleware, async (req, res) => {
       });
     }
 
-    // Find the original entry
-    const originalEntry = await Entry.findById(id);
+    // Find the original entry (lean: a pre-cutover entry is read in FC)
+    const originalEntry = await Entry.findById(id).lean();
     if (!originalEntry) {
       return res.status(404).json({ error: "Entry not found" });
     }
@@ -620,31 +614,22 @@ router.put("/:id", authMiddleware, async (req, res) => {
 
     const normalizedPM = normalizePaymentMethod(paymentMethod);
     const entryAmount = parseFloat(amount);
-    let amountSnapshot;
+    // An unchanged amount leaves the recorded money fields untouched (a
+    // pre-cutover entry keeps its original record); a new amount is FC.
+    let moneyUpdate = {};
     try {
-      const hasExplicitSnapshot = Boolean(req.body.enteredCurrency);
-      const amountChanged = Number(originalEntry.amount) !== entryAmount;
-      amountSnapshot = hasExplicitSnapshot || amountChanged
-        ? normalizeAmountSnapshot(
-            req.body,
-            originalEntry.exchangeRate ?? (await getFallbackExchangeRate())
-          )
-        : {
-            amount: originalEntry.amount,
-            enteredAmount: originalEntry.enteredAmount ?? originalEntry.amount,
-            enteredCurrency: originalEntry.enteredCurrency ?? "USD",
-            amountUSD: originalEntry.amountUSD ?? originalEntry.amount,
-            amountFC: originalEntry.amountFC,
-            exchangeRate: originalEntry.exchangeRate,
-          };
+      const amountChanged = Math.round(Number(originalEntry.amount) * 100) !== Math.round(entryAmount * 100);
+      if (amountChanged) {
+        moneyUpdate = { ...normalizeAmountSnapshot(req.body), $unset: { amountUSD: 1, exchangeRate: 1 } };
+      }
     } catch (pricingError) {
-      return res.status(400).json({ error: pricingError.message });
+      return res.status(pricingError instanceof CurrencyError ? 409 : 400).json({ error: pricingError.message, code: pricingError.code });
     }
 
     // Track changes for audit
     const changes = new Map();
     
-    if (originalEntry.amount !== entryAmount) {
+    if (Math.round(Number(originalEntry.amount) * 100) !== Math.round(entryAmount * 100)) {
       changes.set('amount', { 
         from: originalEntry.amount, 
         to: entryAmount 
@@ -691,7 +676,7 @@ router.put("/:id", authMiddleware, async (req, res) => {
     const updatedEntry = await Entry.findByIdAndUpdate(
       id,
       {
-        ...amountSnapshot,
+        ...moneyUpdate,
         source: source.trim(),
         paymentMethod: normalizedPM,
         category: category.trim(),
@@ -715,7 +700,7 @@ router.put("/:id", authMiddleware, async (req, res) => {
     await recordAudit({ req, action: "ENTRY_EDITED", targetType: "Entry", targetId: id, details: { entryId: updatedEntry?.entryId, reason: reason.trim(), changes: Object.fromEntries(changes) } });
     res.json({
       message: "Entry updated successfully",
-      entry: updatedEntry
+      entry: updatedEntry ? fcEntry(updatedEntry.toObject()) : updatedEntry
     });
   } catch (error) {
     console.error("Error editing entry:", error);
@@ -761,10 +746,10 @@ router.delete("/:id", authMiddleware, async (req, res) => {
       { new: true }
     );
 
-    await recordAudit({ req, action: "ENTRY_DELETED", targetType: "Entry", targetId: req.params.id, before: { status: entry.status, amount: entry.amount, entryId: entry.entryId }, after: { status: "deleted" } });
+    await recordAudit({ req, action: "ENTRY_DELETED", targetType: "Entry", targetId: req.params.id, before: { status: entry.status, amount: fcEntry(entry.toObject()).amount, currency: CURRENCY, entryId: entry.entryId }, after: { status: "deleted" } });
     res.json({
       message: "Entry deleted successfully",
-      entry: deletedEntry
+      entry: deletedEntry ? fcEntry(deletedEntry.toObject()) : deletedEntry
     });
   } catch (error) {
     console.error("Error deleting entry:", error);
@@ -811,7 +796,7 @@ router.patch("/:id/restore", authMiddleware, async (req, res) => {
     await recordAudit({ req, action: "ENTRY_RESTORED", targetType: "Entry", targetId: req.params.id, before: { status: "deleted" }, after: { status: "active" } });
     res.json({
       message: "Entry restored successfully",
-      entry: restoredEntry
+      entry: restoredEntry ? fcEntry(restoredEntry.toObject()) : restoredEntry
     });
   } catch (error) {
     console.error("Error restoring entry:", error);
@@ -986,12 +971,13 @@ router.get("/stats/summary", authMiddleware, async (req, res) => {
     ]);
 
     // Get top entries
-    const topEntries = await Entry.find(timeframeFilter)
-      .populate("createdBy", "username email")
-      .sort({ amount: -1 })
-      .limit(10)
-      .select('entryId source amount category paymentMethod createdAt')
-      .lean();
+    // Ranked in FC (an aggregation is presented in FC by the model hook).
+    const topEntries = await Entry.populate(await Entry.aggregate([
+      { $match: timeframeFilter },
+      { $sort: { amount: -1 } },
+      { $limit: 10 },
+      { $project: { entryId: 1, source: 1, amount: 1, currency: 1, category: 1, paymentMethod: 1, createdAt: 1, createdBy: 1 } },
+    ]), { path: "createdBy", select: "username email" });
 
     // Get most frequent sources
     const frequentSources = await Entry.aggregate([

@@ -6,7 +6,6 @@ const { buildTimeframeFilter } = require("../utils/queryHelpers");
 const { recognizedSaleMatch, saleLineAmountExpressions } = require("../services/financialAccountingService");
 const { isShareholderAdmin, isSuperadmin } = require("../middleware/authorization");
 const { productNormalPrice } = require("../utils/salePricing");
-const { getFallbackExchangeRate } = require("../utils/currentExchangeRate");
 
 const CATEGORIES = ["CLOTHES", "SHOES"];
 const SALE_KINDS = ["SALE", "SALE_CORRECTION", "SALE_VOID", "SALE_DELETE"];
@@ -14,7 +13,8 @@ const SALE_KINDS = ["SALE", "SALE_CORRECTION", "SALE_VOID", "SALE_DELETE"];
 const STREAM_OPENERS = ["INITIAL", "CATEGORY_TRANSFER_IN"];
 // A stream whose last movement is one of these holds nothing any more.
 const STREAM_CLOSERS = ["PRODUCT_DELETE", "CATEGORY_TRANSFER_OUT"];
-const PRICE_FIELDS = "name unit status mainCategory subcategory brand stock price priceEnteredAmount priceEnteredCurrency priceFC priceExchangeRate";
+// Everything the FC presentation of a product price needs (utils/currency.js).
+const PRICE_FIELDS = "name unit status mainCategory subcategory brand stock currency price priceEnteredAmount priceEnteredCurrency priceFC priceExchangeRate";
 
 // Shareholder accounts are pinned to their assigned category whatever the
 // query says; other roles may filter to one category or see both.
@@ -48,33 +48,20 @@ function sendReportError(res, error, label) {
   return res.status(500).json({ error: `Failed to generate ${label.toLowerCase()}` });
 }
 
-// Current normal selling price of a product, in its authoritative currency
-// (utils/salePricing.productNormalPrice): an FC-defined price stays exact in
-// FC, a USD-defined price stays exact in USD; only the other currency follows
-// today's rate. Read-only: nothing is written back to the product.
-function sellingPriceOf(product, rate) {
+// Every amount in these reports is in FC, returned as { fc } money objects.
+// Current normal selling price of a product (read-only).
+function sellingPriceOf(product) {
   if (!product) return null;
-  const normal = productNormalPrice(product, rate);
-  if (!Number.isFinite(normal.usd) && !Number.isFinite(normal.fc)) return null;
-  return {
-    currency: normal.currency,
-    usd: Number.isFinite(normal.usd) ? cents(normal.usd) / 100 : null,
-    fc: Number.isFinite(normal.fc) ? Math.round(normal.fc) : null,
-  };
+  const { fc } = productNormalPrice(product);
+  if (!Number.isFinite(fc)) return null;
+  return { currency: "FC", fc: cents(fc) / 100 };
 }
 
-// Inventory value at selling price = quantity x current unit selling price,
-// computed in the authoritative currency first (exact), the other currency
-// derived from it. This is a valuation of unsold stock, never revenue.
-function inventoryValue(quantity, price, rate) {
-  if (typeof quantity !== "number" || !price) return null;
-  if (price.currency === "FC" && price.fc !== null) {
-    const fc = quantity * price.fc;
-    return { fc, usd: rate ? cents(fc / rate) / 100 : null };
-  }
-  if (price.usd === null) return null;
-  const usdCents = quantity * cents(price.usd);
-  return { usd: usdCents / 100, fc: price.fc !== null ? quantity * price.fc : null };
+// Inventory value at selling price = quantity x current unit selling price.
+// This is a valuation of unsold stock, never revenue.
+function inventoryValue(quantity, price) {
+  if (typeof quantity !== "number" || !price || price.fc === null || price.fc === undefined) return null;
+  return { fc: (quantity * cents(price.fc)) / 100 };
 }
 
 // Fiche de stock: opening balance -> period changes -> closing balance per
@@ -86,7 +73,7 @@ function inventoryValue(quantity, price, rate) {
 async function buildStockSheet({ categories, start, end, productId = null }) {
   const categoryMatch = { mainCategory: { $in: categories } };
   const productMatch = productId ? { productId: new mongoose.Types.ObjectId(String(productId)) } : {};
-  const [beforeRows, withinRows, trackedIds, rate] = await Promise.all([
+  const [beforeRows, withinRows, trackedIds] = await Promise.all([
     StockMovement.aggregate(sortedGroup(
       { ...categoryMatch, ...productMatch, occurredAt: { $lt: start } },
       {
@@ -109,7 +96,6 @@ async function buildStockSheet({ categories, start, end, productId = null }) {
       },
     )).allowDiskUse(true),
     StockMovement.distinct("productId", { ...productMatch, occurredAt: { $lte: end } }),
-    getFallbackExchangeRate(),
   ]);
 
   const before = new Map(beforeRows.map((row) => [streamKey(row._id.productId, row._id.category), row]));
@@ -132,8 +118,8 @@ async function buildStockSheet({ categories, start, end, productId = null }) {
   const productById = new Map(currentProducts.map((product) => [String(product._id), product]));
 
   const withValuation = (row, product) => {
-    const sellingPrice = row.status === "deleted" ? null : sellingPriceOf(product, rate);
-    return { ...row, sellingPrice, inventoryValue: inventoryValue(row.closingStock, sellingPrice, rate) };
+    const sellingPrice = row.status === "deleted" ? null : sellingPriceOf(product);
+    return { ...row, sellingPrice, inventoryValue: inventoryValue(row.closingStock, sellingPrice) };
   };
 
   const rows = [];
@@ -187,14 +173,13 @@ async function buildStockSheet({ categories, start, end, productId = null }) {
     reductions: sum.reductions + row.reductions,
     salesOut: sum.salesOut + row.salesOut,
     closingStock: sum.closingStock + (row.closingStock ?? 0),
-    inventoryValueUSDCents: sum.inventoryValueUSDCents + (row.inventoryValue?.usd != null ? cents(row.inventoryValue.usd) : 0),
-    inventoryValueFC: sum.inventoryValueFC + (row.inventoryValue?.fc ?? 0),
-  }), { openingStock: 0, additions: 0, reductions: 0, salesOut: 0, closingStock: 0, inventoryValueUSDCents: 0, inventoryValueFC: 0 });
-  const { inventoryValueUSDCents, inventoryValueFC, ...quantities } = totals;
+    inventoryValueCents: sum.inventoryValueCents + (row.inventoryValue?.fc != null ? cents(row.inventoryValue.fc) : 0),
+  }), { openingStock: 0, additions: 0, reductions: 0, salesOut: 0, closingStock: 0, inventoryValueCents: 0 });
+  const { inventoryValueCents, ...quantities } = totals;
   return {
     rows,
-    totals: { ...quantities, inventoryValue: { usd: inventoryValueUSDCents / 100, fc: Math.round(inventoryValueFC) } },
-    exchangeRate: rate || null,
+    currency: "FC",
+    totals: { ...quantities, inventoryValue: { fc: inventoryValueCents / 100 } },
     complete: rows.every((row) => row.trackingComplete),
   };
 }
@@ -233,7 +218,7 @@ async function productStockSheet(req, res) {
     return res.json({
       source: "stock-movement-aggregation",
       period: { start: range.$gte, end: range.$lte },
-      exchangeRate: report.exchangeRate,
+      currency: "FC",
       product: {
         productId: String(product._id),
         name: product.name,
@@ -243,7 +228,7 @@ async function productStockSheet(req, res) {
         unit: product.unit || "pcs",
         status: product.status,
         currentStock: product.stock,
-        sellingPrice: sellingPriceOf(product, report.exchangeRate),
+        sellingPrice: sellingPriceOf(product),
       },
       // null when the product did not exist yet during the period.
       row,
@@ -262,20 +247,12 @@ async function productStockSheet(req, res) {
 // Amounts come from each line's immutable snapshots (actual selling price,
 // discounts and family prices included; purchase cost at the time of sale):
 //   revenue = actual selling amount;  profit = revenue - purchase cost
-// so revenue = purchase cost + profit holds exactly (integer cents / FC).
+// so revenue = purchase cost + profit holds exactly (integer hundredths of
+// a franc). Sales are presented in FC by the Sale model hook, historical
+// records through their own FC snapshots.
 async function buildSalesSheet({ categories, start, end, financials }) {
   const range = { $gte: start, $lte: end };
   const line = saleLineAmountExpressions();
-  // The unit price each line was actually sold at, in the currency it was
-  // entered in (exact FC stays exact FC; discounts and family prices included).
-  const soldInFC = { $eq: ["$items.enteredCurrency", "FC"] };
-  const unitPrice = {
-    $cond: [
-      soldInFC,
-      { $ifNull: ["$items.enteredPrice", "$items.priceFC"] },
-      { $round: [{ $cond: [{ $eq: ["$items.enteredCurrency", "USD"] }, { $ifNull: ["$items.enteredPrice", "$items.priceUSD"] }, { $ifNull: ["$items.priceUSD", "$items.price"] }] }, 2] },
-    ],
-  };
   const grouped = await Sale.aggregate([
     { $match: recognizedSaleMatch({ $in: categories }, range) },
     { $unwind: "$items" },
@@ -284,15 +261,14 @@ async function buildSalesSheet({ categories, start, end, financials }) {
       _id: {
         productId: "$items.productId",
         category: "$items.mainCategory",
-        currency: { $cond: [soldInFC, "FC", "USD"] },
-        unitPrice,
+        // The unit price each line was actually sold at (discounts and
+        // family prices included).
+        unitPriceCents: { $round: [{ $multiply: [{ $ifNull: ["$items.price", 0] }, 100] }, 0] },
       },
       name: { $last: "$items.name" },
       quantity: { $sum: "$items.quantity" },
       revenueCents: { $sum: line.revenueCents },
       purchaseCostCents: { $sum: line.cogsCents },
-      revenueFC: { $sum: line.revenueFC },
-      purchaseCostFC: { $sum: line.cogsFC },
     } },
     { $lookup: { from: "products", localField: "_id.productId", foreignField: "_id", as: "product" } },
     { $project: {
@@ -301,12 +277,12 @@ async function buildSalesSheet({ categories, start, end, financials }) {
       product: { $ifNull: [{ $arrayElemAt: ["$product.name", 0] }, "$name"] },
       category: "$_id.category",
       unit: { $ifNull: [{ $arrayElemAt: ["$product.unit", 0] }, "pcs"] },
-      currency: "$_id.currency",
-      unitPrice: "$_id.unitPrice",
-      quantity: 1, revenueCents: 1, purchaseCostCents: 1, revenueFC: 1, purchaseCostFC: 1,
+      unitPriceCents: "$_id.unitPriceCents",
+      quantity: 1, revenueCents: 1, purchaseCostCents: 1,
     } },
   ]).allowDiskUse(true);
 
+  const fcMoney = (valueCents) => ({ fc: valueCents / 100 });
   // One row per product (and category): every price it was sold at with the
   // pieces that left at that price, then the product's totals.
   const byProduct = new Map();
@@ -314,59 +290,51 @@ async function buildSalesSheet({ categories, start, end, financials }) {
     const key = `${group.productId}:${group.category}`;
     const row = byProduct.get(key) ?? {
       productId: group.productId, product: group.product, category: group.category, unit: group.unit,
-      quantitySold: 0, revenueCents: 0, purchaseCostCents: 0, revenueFC: 0, purchaseCostFC: 0, prices: [],
+      quantitySold: 0, revenueCents: 0, purchaseCostCents: 0, prices: [],
     };
-    const revenueFC = Math.round(group.revenueFC);
     row.quantitySold += group.quantity;
     row.revenueCents += group.revenueCents;
     row.purchaseCostCents += group.purchaseCostCents;
-    row.revenueFC += revenueFC;
-    row.purchaseCostFC += Math.round(group.purchaseCostFC);
     row.prices.push({
-      currency: group.currency,
-      // The sold unit price in its own currency, and its equivalent.
-      unitPrice: group.currency === "FC"
-        ? { fc: group.unitPrice, usd: Math.round(group.revenueCents / group.quantity) / 100 }
-        : { usd: group.unitPrice, fc: Math.round(revenueFC / group.quantity) },
+      currency: "FC",
+      unitPrice: fcMoney(group.unitPriceCents),
       quantity: group.quantity,
-      revenue: { usd: group.revenueCents / 100, fc: revenueFC },
+      revenue: fcMoney(group.revenueCents),
     });
     byProduct.set(key, row);
   }
 
-  const total = { quantity: 0, revenueCents: 0, purchaseCostCents: 0, revenueFC: 0, purchaseCostFC: 0 };
+  const total = { quantity: 0, revenueCents: 0, purchaseCostCents: 0 };
   const rows = [...byProduct.values()]
     .sort((a, b) => b.quantitySold - a.quantitySold || a.product.localeCompare(b.product, "fr"))
     .map((row) => {
       total.quantity += row.quantitySold;
       total.revenueCents += row.revenueCents;
       total.purchaseCostCents += row.purchaseCostCents;
-      total.revenueFC += row.revenueFC;
-      total.purchaseCostFC += row.purchaseCostFC;
-      row.prices.sort((a, b) => (b.unitPrice.usd ?? 0) - (a.unitPrice.usd ?? 0));
+      row.prices.sort((a, b) => (b.unitPrice.fc ?? 0) - (a.unitPrice.fc ?? 0));
       const base = {
         productId: row.productId, product: row.product, category: row.category, unit: row.unit,
         prices: row.prices,
         quantitySold: row.quantitySold,
-        revenue: { usd: row.revenueCents / 100, fc: row.revenueFC },
+        revenue: fcMoney(row.revenueCents),
       };
       if (!financials) return base;
       return {
         ...base,
-        purchaseCost: { usd: row.purchaseCostCents / 100, fc: row.purchaseCostFC },
-        profit: { usd: (row.revenueCents - row.purchaseCostCents) / 100, fc: row.revenueFC - row.purchaseCostFC },
+        purchaseCost: fcMoney(row.purchaseCostCents),
+        profit: fcMoney(row.revenueCents - row.purchaseCostCents),
       };
     });
   const summary = {
     skusSold: rows.length,
     unitsSold: total.quantity,
-    revenue: { usd: total.revenueCents / 100, fc: total.revenueFC },
+    revenue: fcMoney(total.revenueCents),
     ...(financials ? {
-      purchaseCost: { usd: total.purchaseCostCents / 100, fc: total.purchaseCostFC },
-      profit: { usd: (total.revenueCents - total.purchaseCostCents) / 100, fc: total.revenueFC - total.purchaseCostFC },
+      purchaseCost: fcMoney(total.purchaseCostCents),
+      profit: fcMoney(total.revenueCents - total.purchaseCostCents),
     } : {}),
   };
-  return { rows, summary, financialsVisible: Boolean(financials) };
+  return { rows, summary, currency: "FC", financialsVisible: Boolean(financials) };
 }
 
 async function salesSheet(req, res) {

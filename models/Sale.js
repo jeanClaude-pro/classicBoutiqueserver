@@ -1,4 +1,5 @@
 const mongoose = require("mongoose");
+const { fcSale, registerFCView, saleFCStages } = require("../utils/currency");
 
 const saleItemSchema = new mongoose.Schema({
   productId: {
@@ -148,7 +149,13 @@ const saleSchema = new mongoose.Schema({
   // Deprecated compatibility fields retained for historical documents.
   shopProfit: { type: Number, required: false },
   partnerProfit: { type: Number, required: false },
-  // Snapshot used for this transaction; historical sales never use today's rate.
+  // "FC" on every record written since the FC-only cutover. Records without
+  // it are pre-cutover USD records, presented in FC by utils/currency.js.
+  // Deliberately no default: a default would be applied to legacy documents
+  // on load and could be saved back onto a USD record.
+  currency: { type: String, enum: ["FC"], default: undefined },
+  // Pre-cutover sales only: the rate their USD figures were recorded at.
+  // New sales never carry one.
   exchangeRate: {
     type: Number,
     required: false,
@@ -312,5 +319,7 @@ saleSchema.pre("save", function(next) {
   
   next();
 });
+
+registerFCView(saleSchema, { view: fcSale, stages: saleFCStages });
 
 module.exports = mongoose.model("Sale", saleSchema);

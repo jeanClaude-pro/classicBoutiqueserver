@@ -18,7 +18,7 @@ const itest = (name, fn) => test(name, { skip: SKIP }, fn);
 
 itest("every recorded sale has an audit record written with it", async () => {
   const product = await ctx.product("CLOTHES", 10, 20);
-  const created = await ctx.sell([{ product, quantity: 2 }], { exchangeRate: 2800, requestKey: "audit-sale-1" });
+  const created = await ctx.sell([{ product, quantity: 2 }], { requestKey: "audit-sale-1" });
   assert.equal(created.status, 201);
   const audit = await AuditLog.findOne({ action: "SALE_RECORDED", targetId: String(created.body._id) }).lean();
   assert.ok(audit, "SALE_RECORDED exists");
@@ -30,8 +30,8 @@ itest("every recorded sale has an audit record written with it", async () => {
 
 itest("a retried sale is recorded once and audited once", async () => {
   const product = await ctx.product("SHOES", 10, 20, 10);
-  const first = await ctx.sell([{ product, quantity: 1 }], { exchangeRate: 2800, requestKey: "retry-sale-1" });
-  const second = await ctx.sell([{ product, quantity: 1 }], { exchangeRate: 2800, requestKey: "retry-sale-1" });
+  const first = await ctx.sell([{ product, quantity: 1 }], { requestKey: "retry-sale-1" });
+  const second = await ctx.sell([{ product, quantity: 1 }], { requestKey: "retry-sale-1" });
   assert.equal(first.status, 201);
   assert.equal(second.status, 200);
   assert.equal(await Sale.countDocuments({ requestKey: "retry-sale-1" }), 1);
@@ -40,7 +40,7 @@ itest("a retried sale is recorded once and audited once", async () => {
 
 itest("a refused sale is kept in the audit log with the cart that was sent", async () => {
   const product = await ctx.product("CLOTHES", 10, 20, 1);
-  const refused = await ctx.sell([{ product, quantity: 3 }], { exchangeRate: 2800, requestKey: "refused-sale-1" });
+  const refused = await ctx.sell([{ product, quantity: 3 }], { requestKey: "refused-sale-1" });
   assert.ok(refused.status >= 400);
   assert.equal(await Sale.countDocuments({}), 0);
   const audit = await AuditLog.findOne({ action: "SALE_REJECTED", "details.attempt.requestKey": "refused-sale-1" }).lean();
@@ -80,13 +80,13 @@ itest("expense creation and validation are audited", async () => {
 
 itest("a retried loan adds the debt once", async () => {
   const creditor = await Creditor.create({ name: `Prêteur-${Date.now()}`, type: "person", createdBy: ctx.users.superadmin.user._id });
-  const body = { enteredAmount: 100, enteredCurrency: "USD", exchangeRate: 2800, amount: 100, requestKey: `loan-${creditor._id}` };
+  const body = { enteredAmount: 100000, enteredCurrency: "FC", amount: 100000, requestKey: `loan-${creditor._id}` };
   const first = await ctx.request("POST", `/creditors/${creditor._id}/loans`, { token: ctx.token("superadmin"), body });
   const second = await ctx.request("POST", `/creditors/${creditor._id}/loans`, { token: ctx.token("superadmin"), body });
   assert.equal(first.status, 201);
   assert.equal(second.status, 200);
   assert.equal(await Loan.countDocuments({ creditorId: creditor._id }), 1);
-  assert.equal((await Creditor.findById(creditor._id)).remainingBalance, 100);
+  assert.equal((await Creditor.findById(creditor._id)).remainingBalance, 100000);
   assert.ok(await AuditLog.exists({ action: "LOAN_RECORDED", targetId: String(creditor._id) }));
 });
 

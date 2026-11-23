@@ -6,13 +6,13 @@ const crypto = require("node:crypto");
 const Sale = require("../models/Sale");
 const Customer = require("../models/Customer");
 const Product = require("../models/Product");
-const ExchangeRate = require("../models/ExchangeRate");
 const authMiddleware = require("../middleware/auth");
 const {
-  normalizeExchangeRate,
+  CurrencyError,
   normalizeSaleItemPricing,
   productNormalPrice,
 } = require("../utils/salePricing");
+const { CURRENCY, fcSale, productUnitCostFC } = require("../utils/currency");
 const {
   buildTimeframeFilter: buildBusinessTimeframeFilter,
   currentBusinessDate,
@@ -29,7 +29,6 @@ const {
   calculateProfitSnapshot,
   sumFinancialSnapshots,
 } = require("../utils/profitCalculations");
-const { getFallbackExchangeRate } = require("../utils/currentExchangeRate");
 const { authorizedCategory, isShareholderAdmin } = require("../middleware/authorization");
 const { categoryRestrictedSaleStages } = require("../utils/categoryScope");
 const { acquireAccountingLocksForItems } = require("../services/financialAccountingService");
@@ -60,9 +59,10 @@ function cleanCustomerInput(customer) {
   };
 }
 class HttpError extends Error {
-  constructor(status, message) {
+  constructor(status, message, code) {
     super(message);
     this.status = status;
+    if (code) this.code = code;
   }
 }
 
@@ -75,7 +75,9 @@ const PROTECTED_SALE_FIELDS = [
 ];
 const canViewProtectedFinancials = (user) => ["admin", "superadmin"].includes(user?.role);
 function safeSaleResponse(sale, user) {
-  const value = typeof sale.toObject === "function" ? sale.toObject() : { ...sale };
+  // Every sale leaves the API in FC: a pre-cutover record is presented
+  // through its own historical FC snapshot (utils/currency.js).
+  const value = fcSale(typeof sale.toObject === "function" ? sale.toObject() : { ...sale });
   delete value.requestFingerprint;
   if (canViewProtectedFinancials(user)) return value;
   for (const field of PROTECTED_SALE_FIELDS) delete value[field];
@@ -102,82 +104,50 @@ const itemShareholderExpressions = {
   },
 };
 
-// FC revenue of a sale recorded before totalRevenueFC existed: each line's
-// exact FC snapshot first, else its USD revenue at the line's own historical
-// rate. Today's rate is never involved.
-const legacySaleRevenueFC = {
-  $reduce: {
-    input: { $ifNull: ["$items", []] },
-    initialValue: 0,
-    in: { $add: ["$$value", { $ifNull: ["$$this.revenueFC", { $ifNull: [
-      { $multiply: [{ $cond: [{ $eq: ["$$this.enteredCurrency", "FC"] }, "$$this.enteredPrice", "$$this.priceFC"] }, "$$this.quantity"] },
-      { $multiply: [
-        { $ifNull: ["$$this.revenue", { $ifNull: ["$$this.total", 0] }] },
-        { $ifNull: ["$$this.exchangeRate", { $ifNull: ["$exchangeRate", 0] }] },
-      ] },
-    ] }] }] },
-  },
-};
-
+// Every amount here is FC. `product` is a lean Product (already presented
+// in FC) and `priorItem` a line of the sale being corrected (also FC).
 function financialSaleItem(product, pricing, quantity, priorItem = null) {
-  const unitAcquisitionCost = priorItem?.unitAcquisitionCost ?? product.unitCost;
+  const unitAcquisitionCost = priorItem?.unitAcquisitionCost ?? productUnitCostFC(product);
   const mainCategory = priorItem?.mainCategory ?? product.mainCategory;
-  const historicalRate = pricing.exchangeRate ?? priorItem?.exchangeRate;
-  const unitSellingPriceFC = pricing.priceFC ?? (historicalRate ? pricing.price * historicalRate : undefined);
-  const unitAcquisitionCostFC = priorItem?.unitAcquisitionCostFC ?? product.unitCostFC ??
-    (product.unitCostExchangeRate ? unitAcquisitionCost * product.unitCostExchangeRate :
-      historicalRate ? unitAcquisitionCost * historicalRate : undefined);
-  if (unitAcquisitionCost === undefined || !mainCategory) {
+  if (unitAcquisitionCost === undefined || unitAcquisitionCost === null || !mainCategory) {
     throw new HttpError(
       409,
-      `Le produit ${product.name} doit être classé et doté d'un coût d'acquisition avant la vente.`
+      `Le produit ${product.name} doit être classé et doté d'un coût d'acquisition en FC avant la vente.`
     );
   }
   return calculateProfitSnapshot({
     unitSellingPrice: pricing.price,
     unitAcquisitionCost,
-    unitSellingPriceFC,
-    unitAcquisitionCostFC,
+    unitSellingPriceFC: pricing.price,
+    unitAcquisitionCostFC: unitAcquisitionCost,
     quantity,
     mainCategory,
   });
 }
 
-// A new line's normal price comes from the Product's authoritative currency
-// at the transaction rate (productNormalPrice). A correction must not
+// A new line's normal price is the Product's FC price. A correction must not
 // reinterpret a legacy custom price as a newly found discount: existing lines
 // use their saved reference when available, or their own historical actual
 // price as the backward-compatible reference — never today's Product price.
-function referencePricing(product, rate, priorItem = null) {
-  if (!priorItem) {
-    const normal = productNormalPrice(product, rate);
-    return { usd: normal.usd, fc: normal.fc };
-  }
-  if (priorItem.referenceUnitSellingPrice !== undefined) {
-    return {
-      usd: priorItem.referenceUnitSellingPrice,
-      fc: priorItem.referenceUnitSellingPriceFC ??
-        (rate ? Math.round(priorItem.referenceUnitSellingPrice * rate) : undefined),
-    };
-  }
-  const usd = priorItem.unitSellingPrice ?? priorItem.priceUSD ?? priorItem.price;
-  const ownFC = priorItem.enteredCurrency === "FC" ? priorItem.enteredPrice : priorItem.priceFC;
-  return { usd, fc: ownFC ?? (rate ? Math.round(usd * rate) : undefined) };
+function referencePrice(product, priorItem = null) {
+  if (!priorItem) return productNormalPrice(product).fc;
+  return priorItem.referenceUnitSellingPrice ?? priorItem.unitSellingPrice ?? priorItem.price;
 }
 
-function discountSnapshot(product, pricing, cartQuantity, rate, priorItem = null, { discountLimited = false, familySale = false } = {}) {
-  const reference = referencePricing(product, rate, priorItem);
-  const enteredInFC = pricing.enteredCurrency === "FC";
+function discountSnapshot(product, pricing, cartQuantity, priorItem = null, { discountLimited = false, familySale = false } = {}) {
+  const reference = referencePrice(product, priorItem);
+  if (reference === undefined || reference === null || !(Number(reference) > 0)) {
+    throw new HttpError(409, `Le produit ${product.name} n'a pas de prix de vente en FC. Mettez à jour son prix avant la vente.`);
+  }
   let result;
   try {
     result = validateUnitSellingPrice({
       actualUnitPrice: pricing.price,
-      referenceUnitPrice: reference.usd,
-      unitAcquisitionCost: priorItem?.unitAcquisitionCost ?? product.unitCost,
+      referenceUnitPrice: reference,
+      unitAcquisitionCost: priorItem?.unitAcquisitionCost ?? productUnitCostFC(product),
       cartQuantity,
       skipQuantityRequirement: familySale,
       acquisitionCostOnlyFloor: familySale,
-      ...(enteredInFC ? { actualUnitPriceFC: pricing.priceFC, referenceUnitPriceFC: reference.fc } : {}),
     });
   } catch (error) {
     // While limited, a reduced price gets the same answer above or below the
@@ -186,17 +156,12 @@ function discountSnapshot(product, pricing, cartQuantity, rate, priorItem = null
     throw error;
   }
   if (discountLimited && result.discountApplied) throw discountAttemptsLimitedError();
-  const actualFC = pricing.priceFC;
   return {
     discountApplied: result.discountApplied,
     referenceUnitSellingPrice: result.referenceUnitSellingPrice,
+    referenceUnitSellingPriceFC: result.referenceUnitSellingPrice,
     discountPerUnit: result.discountPerUnit,
-    referenceUnitSellingPriceFC: reference.fc,
-    discountPerUnitFC: result.discountPerUnitFC ?? (
-      result.discountApplied && reference.fc !== undefined && actualFC !== undefined
-        ? Math.max(0, reference.fc - actualFC)
-        : 0
-    ),
+    discountPerUnitFC: result.discountPerUnit,
   };
 }
 
@@ -222,10 +187,10 @@ function recordDiscountRejection(user, error) {
 }
 
 // Validates and prices every line with authoritative data only: the Product
-// (or, for a correction, the line's own immutable snapshot), the server-side
-// exchange rate and the whole-cart quantity. Nothing is written here, so a
+// (or, for a correction, the line's own immutable snapshot) and the
+// whole-cart quantity, all in FC. Nothing is written here, so a
 // rejected discount can never leave a partial stock or sale mutation behind.
-async function priceSaleItems(items, { saleRate, priorSale = null, checkStock = false, user = null, familySale = false }) {
+async function priceSaleItems(items, { priorSale = null, checkStock = false, user = null, familySale = false }) {
   if (!items || !Array.isArray(items) || items.length === 0) {
     throw new HttpError(400, "Sale must contain at least one item");
   }
@@ -258,23 +223,20 @@ async function priceSaleItems(items, { saleRate, priorSale = null, checkStock = 
       String(candidate.productId) === String(productId) &&
       ((item._id && String(candidate._id) === String(item._id)) || !item._id)
     ) ?? null;
-    // Client-supplied rates are never trusted: an existing line keeps its own
-    // historical rate, every other line uses the transaction's rate.
-    const itemRate = priorItem?.exchangeRate ?? saleRate;
-
     let pricing;
     let financials;
     let discount;
     try {
-      pricing = normalizeSaleItemPricing({ ...item, exchangeRate: itemRate }, itemRate);
+      pricing = normalizeSaleItemPricing(item);
       financials = financialSaleItem(product, pricing, Number(quantity), priorItem);
-      discount = discountSnapshot(product, pricing, cartQuantity, itemRate, priorItem, { discountLimited, familySale });
+      discount = discountSnapshot(product, pricing, cartQuantity, priorItem, { discountLimited, familySale });
     } catch (pricingError) {
       if (pricingError instanceof DiscountValidationError) {
         pricingError.itemIndex = itemIndex;
         throw pricingError;
       }
       if (pricingError instanceof HttpError) throw pricingError;
+      if (pricingError instanceof CurrencyError) throw new HttpError(409, pricingError.message, pricingError.code);
       throw new HttpError(400, pricingError.message);
     }
 
@@ -282,8 +244,8 @@ async function priceSaleItems(items, { saleRate, priorSale = null, checkStock = 
       productId: new mongoose.Types.ObjectId(productId),
       name: boundedString(name, 200) || product.name,
       quantity: Number(quantity),
-      // The exact entered-currency snapshot. The separately stored
-      // unitSellingPrice is the cent-rounded accounting value used by revenue.
+      // The exact entered FC price. The separately stored unitSellingPrice is
+      // the rounded accounting value used by revenue.
       ...pricing,
       total: financials.revenue,
       ...discount,
@@ -293,37 +255,18 @@ async function priceSaleItems(items, { saleRate, priorSale = null, checkStock = 
   return enrichedItems;
 }
 
-class ExchangeRateMismatchError extends HttpError {
-  constructor(activeRate) {
-    super(409, "Le taux de change a changé. Vérifiez les prix du panier puis réessayez.");
-    this.code = "EXCHANGE_RATE_CHANGED";
-    this.activeRate = activeRate;
+// An offline sale keeps the time it happened at the till, within limits: a
+// clock far in the future or a sale queued for more than a week is refused.
+// Offline sales queued before the FC-only cutover may still carry the rate
+// they were priced at; their FC prices are authoritative and it is ignored.
+function offlineOccurredAt(body) {
+  if (body.offline !== true || !body.occurredAt) return undefined;
+  const occurredAt = new Date(body.occurredAt);
+  const age = Date.now() - occurredAt.getTime();
+  if (!Number.isFinite(occurredAt.getTime()) || age < -5 * 60 * 1000 || age > 7 * 24 * 60 * 60 * 1000) {
+    throw new HttpError(409, "La date de la vente hors ligne est invalide ou trop ancienne.");
   }
-}
-
-// A new transaction always uses the rate active on the server. A client that
-// priced its cart at another rate (stale page, or a forged request trying to
-// shrink the USD value of an FC price) is refused instead of being trusted.
-async function resolveNewSaleExchangeRate(body) {
-  let activeRate;
-  if (body.offline === true && body.occurredAt) {
-    const occurredAt = new Date(body.occurredAt);
-    const age = Date.now() - occurredAt.getTime();
-    if (!Number.isFinite(occurredAt.getTime()) || age < -5 * 60 * 1000 || age > 7 * 24 * 60 * 60 * 1000) {
-      throw new HttpError(409, "La date de la vente hors ligne est invalide ou trop ancienne.");
-    }
-    const historical = await ExchangeRate.findOne({ effectiveFrom: { $lte: occurredAt } }).sort({ effectiveFrom: -1 }).lean();
-    if (!historical) throw new HttpError(409, "Aucun taux historique ne correspond à cette vente hors ligne.");
-    activeRate = normalizeExchangeRate(historical.rate);
-  } else {
-    activeRate = normalizeExchangeRate(await getFallbackExchangeRate());
-  }
-  const claimedRates = [body.exchangeRate, ...(Array.isArray(body.items) ? body.items.map((item) => item?.exchangeRate) : [])]
-    .filter((rate) => rate !== undefined && rate !== null && rate !== "");
-  for (const claimed of claimedRates) {
-    if (Number(claimed) !== Number(activeRate)) throw new ExchangeRateMismatchError(activeRate);
-  }
-  return activeRate;
+  return occurredAt;
 }
 
 function sendDiscountError(res, error) {
@@ -390,8 +333,7 @@ function saleAuditSnapshot(sale) {
     type: sale.type,
     status: sale.status,
     total: sale.total,
-    totalRevenueFC: sale.totalRevenueFC,
-    exchangeRate: sale.exchangeRate,
+    currency: CURRENCY,
     paymentMethod: sale.paymentMethod,
     salesPerson: sale.salesPerson,
     isWalkIn: sale.isWalkIn,
@@ -419,9 +361,9 @@ function attemptedSaleAudit(body = {}) {
   return {
     requestKey: saleRequestKey(body),
     receiptNumber: typeof body.receiptNumber === "string" ? body.receiptNumber.slice(0, 120) : undefined,
+    currency: CURRENCY,
     offline: body.offline === true,
     occurredAt: typeof body.occurredAt === "string" ? body.occurredAt.slice(0, 40) : undefined,
-    exchangeRate: Number(body.exchangeRate) || undefined,
     paymentMethod: typeof body.paymentMethod === "string" ? body.paymentMethod.slice(0, 30) : undefined,
     isWalkIn: Boolean(body.isWalkIn),
     isFamilySale: body.isFamilySale === true,
@@ -541,7 +483,8 @@ async function recalculateCustomerStats(customerId, session = null) {
       status: { $in: ["completed", "pending", null] }
     })
     .sort({ createdAt: 1 })
-    .select('total status type createdAt') // Only select needed fields
+    // Only the fields the FC presentation needs (utils/currency.js).
+    .select('total totalRevenue totalRevenueFC currency exchangeRate items status type createdAt')
     .session(session)
     .lean();
     
@@ -602,7 +545,6 @@ function sendMutationError(res, error, fallbackMessage) {
       return res.status(error.status).json({
         error: error.code,
         message: error.message,
-        ...(error.activeRate !== undefined ? { exchangeRate: error.activeRate } : {}),
       });
     }
     return res.status(error.status).json({ error: error.message });
@@ -894,15 +836,6 @@ router.get("/", authMiddleware, canUsePosOrHistory, async (req, res) => {
                   ],
                 },
               },
-              totalRevenueFC: {
-                $sum: {
-                  $cond: [
-                    { $and: [{ $ne: ["$type", "expense"] }, { $eq: ["$status", "completed"] }] },
-                    { $ifNull: ["$totalRevenueFC", legacySaleRevenueFC] },
-                    0,
-                  ],
-                },
-              },
               costOfGoodsSold: {
                 $sum: { $cond: [{ $and: [{ $ne: ["$type", "expense"] }, { $eq: ["$status", "completed"] }] }, { $ifNull: ["$costOfGoodsSold", 0] }, 0] },
               },
@@ -951,7 +884,6 @@ router.get("/", authMiddleware, canUsePosOrHistory, async (req, res) => {
     
     const totals = facet.summary?.[0] || {
       totalRevenue: 0,
-      totalRevenueFC: 0,
       costOfGoodsSold: 0,
       grossProfit: 0,
       shopProfit: 0,
@@ -989,8 +921,8 @@ router.get("/", authMiddleware, canUsePosOrHistory, async (req, res) => {
       },
       summary: {
         totalRecords: total,
+        currency: CURRENCY,
         revenue: totals.totalRevenue,
-        revenueFC: totals.totalRevenueFC,
         costOfGoodsSold: shareholderTotals.costOfGoodsSold,
         grossProfit: shareholderTotals.grossProfit,
         clothesShareholderProfit: shareholderTotals.clothesShareholderProfit,
@@ -1000,7 +932,6 @@ router.get("/", authMiddleware, canUsePosOrHistory, async (req, res) => {
         partnerProfit: totals.partnerProfit,
         expenses: totals.totalExpenses,
         net: totals.totalRevenue - totals.totalExpenses,
-        netFC: totals.totalRevenueFC,
         salesCount: totals.saleCount,
         expensesCount: totals.expenseCount,
         completedCount: totals.completedCount,
@@ -1023,8 +954,8 @@ router.get("/", authMiddleware, canUsePosOrHistory, async (req, res) => {
     if (isShareholderAdmin(req.user)) {
       response.summary = {
         totalRecords: total,
+        currency: CURRENCY,
         revenue: totals.totalRevenue,
-        revenueFC: totals.totalRevenueFC,
         costOfGoodsSold: shareholderTotals.costOfGoodsSold,
         grossProfit: shareholderTotals.grossProfit,
         shareholderEntitlement: category === "CLOTHES"
@@ -1179,7 +1110,7 @@ router.post("/", authMiddleware, requireModuleAccess("/"), async (req, res) => {
       return res.status(400).json({ error: "FAMILY_MEMBER_INVALID", message: "Le client sélectionné n'est pas un membre de famille enregistré." });
     }
 
-    const transactionExchangeRate = await resolveNewSaleExchangeRate(req.body);
+    const occurredAt = offlineOccurredAt(req.body);
 
     if (walkIn && type === "reservation") {
       return res.status(400).json({
@@ -1194,7 +1125,6 @@ router.post("/", authMiddleware, requireModuleAccess("/"), async (req, res) => {
     }
 
     const enrichedItems = await priceSaleItems(items, {
-      saleRate: transactionExchangeRate,
       checkStock: true,
       user: req.user,
       familySale,
@@ -1238,7 +1168,7 @@ router.post("/", authMiddleware, requireModuleAccess("/"), async (req, res) => {
       subtotal,
       total,
       ...financialTotals,
-      exchangeRate: transactionExchangeRate,
+      currency: CURRENCY,
       paymentMethod: normalizedPM,
       status: "completed",
       // Attribution always comes from the authenticated session.
@@ -1251,9 +1181,9 @@ router.post("/", authMiddleware, requireModuleAccess("/"), async (req, res) => {
       clientSaleId: requestKey || undefined,
       receiptNumber: typeof req.body.receiptNumber === "string" ? req.body.receiptNumber.trim().slice(0, 120) : undefined,
       requestFingerprint: requestKey ? saleRequestFingerprint(req.body) : undefined,
-      // Only a validated offline sale keeps its client time (checked against
-      // the historical rate above); every other sale is dated by the server.
-      occurredAt: req.body.offline === true && req.body.occurredAt ? new Date(req.body.occurredAt) : undefined,
+      // Only a validated offline sale keeps its client time (checked above);
+      // every other sale is dated by the server.
+      occurredAt,
       createdBy: req.user._id,
     };
 
@@ -1318,7 +1248,7 @@ router.post("/", authMiddleware, requireModuleAccess("/"), async (req, res) => {
       await recordAudit({
         req, action: familySale ? "SALE_FAMILY_RECORDED" : "SALE_DISCOUNT_APPLIED", targetType: "Sale", targetId: savedSale._id,
         details: {
-          saleId: savedSale.saleId, total: savedSale.total,
+          saleId: savedSale.saleId, total: savedSale.total, currency: CURRENCY,
           lines: discountedLines.map((item) => ({ productId: item.productId, name: item.name, quantity: item.quantity, unitPrice: item.price, referenceUnitPrice: item.referenceUnitSellingPrice, discountPerUnit: item.discountPerUnit })),
         },
       });
@@ -1341,7 +1271,7 @@ router.post("/", authMiddleware, requireModuleAccess("/"), async (req, res) => {
     console.error("Error creating sale/expense:", error);
     // Every refused or failed sale attempt is kept centrally with the cart the
     // till sent, so a sale refused while syncing from a device is never lost
-    // from view (stock, exchange rate, date checks, server errors...).
+    // from view (stock, currency, date checks, server errors...).
     await recordAudit({
       req, action: "SALE_REJECTED", outcome: "failure", targetType: "Sale",
       details: {
@@ -1707,6 +1637,8 @@ router.put("/:id", authMiddleware, canUseHistory, canCorrectSales, async (req, r
           recipientPhone,
           subtotal: expenseAmount,
           total: expenseAmount,
+          currency: CURRENCY,
+          $unset: { exchangeRate: 1 },
           paymentMethod: normalizedPM,
           notes: notes || originalSale.notes,
           editedBy: req.user.username,
@@ -1724,7 +1656,7 @@ router.put("/:id", authMiddleware, canUseHistory, canCorrectSales, async (req, r
       );
 
       await recordAudit({ req, action: "LEGACY_EXPENSE_EDITED", targetType: "Sale", targetId: id, details: { changes: Object.fromEntries(changes) } });
-      return res.json(updatedExpense);
+      return res.json(fcSale(updatedExpense.toObject()));
     }
 
     // 🔹 HANDLE REGULAR SALE EDITING
@@ -1736,12 +1668,9 @@ router.put("/:id", authMiddleware, canUseHistory, canCorrectSales, async (req, r
     // sale's existing flag when the client doesn't include it in the payload.
     const walkIn = typeof isWalkIn === "boolean" ? isWalkIn : Boolean(originalSale.isWalkIn);
     const effectiveType = type || originalSale.type;
-    // A correction belongs to the original transaction: its saved rate is
-    // authoritative and a client-sent rate is ignored. Only a legacy sale
-    // that never had a snapshot falls back to the rate active today.
-    const transactionExchangeRate =
-      normalizeExchangeRate(originalSale.exchangeRate) ??
-      normalizeExchangeRate(await getFallbackExchangeRate());
+    // A correction is re-priced in FC. `originalSale` is a lean read, so a
+    // pre-cutover sale is already presented through its own FC snapshot;
+    // once corrected, the record is an FC record.
 
     if (walkIn && effectiveType === "reservation") {
       return res.status(400).json({
@@ -1769,7 +1698,6 @@ router.put("/:id", authMiddleware, canUseHistory, canCorrectSales, async (req, r
     // brings the cart under 5 pieces while a line stays discounted is refused
     // (DISCOUNT_QUANTITY_REQUIRED) before any stock or sale mutation.
     const enrichedItems = await priceSaleItems(items, {
-      saleRate: transactionExchangeRate,
       priorSale: originalSale,
       user: req.user,
       // Only the superadmin may keep the family exception while correcting a
@@ -1857,7 +1785,8 @@ router.put("/:id", authMiddleware, canUseHistory, canCorrectSales, async (req, r
           subtotal,
           total,
           ...financialTotals,
-          exchangeRate: transactionExchangeRate,
+          currency: CURRENCY,
+          $unset: { exchangeRate: 1 },
           paymentMethod: normalizedPM,
           type: effectiveType,
           reservationDate: reservationDate || originalSale.reservationDate,
@@ -2083,7 +2012,7 @@ router.patch("/:id/void", authMiddleware, async (req, res) => {
       req, action: "SALE_VOIDED", targetType: "Sale", targetId: id,
       before: saleAuditSnapshot(sale),
       after: { status: "voided" },
-      details: { saleId: updatedSale.saleId, total: updatedSale.total, reason: reason || "Sale voided", items: (updatedSale.items || []).map((item) => ({ productId: item.productId, name: item.name, quantity: item.quantity })) },
+      details: { saleId: updatedSale.saleId, total: fcSale(updatedSale.toObject()).total, currency: CURRENCY, reason: reason || "Sale voided", items: (updatedSale.items || []).map((item) => ({ productId: item.productId, name: item.name, quantity: item.quantity })) },
       session,
     });
     return updatedSale;
